@@ -12,7 +12,7 @@ iota:
   timeout: 5s
 
 storage:
-  kind: redis # memory | redis
+  kind: memory # memory | redis (not implemented yet)
   redis:
     url: ${REDIS_URL}
     key_prefix: gas-station-router
@@ -28,23 +28,27 @@ routing:
         - connect_error
   execute_tx:
     timeout: 30s
-    
+
     inflight:
       lease_ttl: 45s
       record_ttl: 30m
+
   ttl:
     reservation: 15m
     transaction_effects: 30m
 
 backends:
   - name: gas_station_a
+    enabled: true
     token: ""
-    rpc: http://localhost:9257
-
-  - name: gas_station_b
-    token: ${GAS_STATION_B_TOKEN}
     rpc: http://localhost:9258
 
-  - name: gas_station_c
-    token: "..."
+  - name: gas_station_b
+    enabled: true
+    token: ${GAS_STATION_B_TOKEN}
     rpc: http://localhost:9259
+
+  - name: gas_station_c
+    enabled: false
+    token: "..."
+    rpc: http://localhost:9260

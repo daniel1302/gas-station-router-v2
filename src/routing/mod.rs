@@ -1,3 +1,5 @@
+pub mod round_robin;
+
 /// A backend eligible to receive a new gas reservation.
 #[derive(Debug, Clone)]
 pub struct BackendCandidate {
@@ -28,8 +30,5 @@ pub trait BackendSelector: Send + Sync {
     /// Selects a backend.
     ///
     /// Returns None if no candidates are available.
-    fn select(
-        &self,
-        candidates: &[BackendCandidate],
-    ) -> Option<usize>;
+    fn select(&self, candidates: &[BackendCandidate]) -> Option<usize>;
 }
