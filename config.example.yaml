@@ -40,9 +40,11 @@ backends:
   - name: gas_station_a
     token: ""
     rpc: http://localhost:9257
+
   - name: gas_station_b
     token: ${GAS_STATION_B_TOKEN}
     rpc: http://localhost:9258
+
   - name: gas_station_c
     token: "..."
     rpc: http://localhost:9259
