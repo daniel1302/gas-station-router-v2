@@ -1,0 +1,40 @@
+rpc:
+  host: 0.0.0.0
+  port: 9257
+  token: ${GS_AUTH}
+
+metrics:
+  host: 0.0.0.0
+  port: 9184
+
+storage:
+  kind: redis # memory | redis
+  redis:
+    url: ${REDIS_URL}
+    key_prefix: gas-station-router
+
+routing:
+  algorithm: round_robin
+  reserve_gas:
+    timeout: 3s
+    retries:
+      max_retries: 1
+      backoff: 200ms
+      retry_on:
+        - connect_error
+  execute_tx:
+    timeout: 30s
+  ttl:
+    reservation: 15m
+    transaction_effects: 24h
+
+backends:
+  - name: gas_station_a
+    token: ""
+    rpc: http://localhost:9257
+  - name: gas_station_b
+    token: ${GAS_STATION_B_TOKEN}
+    rpc: http://localhost:9258
+  - name: gas_station_c
+    token: "..."
+    rpc: http://localhost:9259
