@@ -1,9 +1,9 @@
 # Gas Station Router v2
 
-Minimal Rust service with a YAML config, a Clap CLI and separate RPC and metrics
-HTTP servers. Routing, authentication and storage operations are not implemented
-yet. Tokens, routing settings and storage settings are only loaded from config;
-startup does not connect to Redis or the backends.
+Minimal Rust service with a YAML config, a Clap CLI, separate RPC and metrics
+HTTP servers and an in-memory implementation of the storage trait. RPC handlers
+are still dummy handlers: routing, authentication and storage integration are not
+implemented yet. Startup does not connect to Redis or the backends.
 
 ```sh
 cargo run -- init                       # YAML on stdout
@@ -41,6 +41,21 @@ address before implementing forwarding.
 The config key is `routing.execute_tx`; the HTTP path is
 `/v1/execute_transaction`. Both listeners bind before serving. SIGINT and SIGTERM
 gracefully stop both servers.
+
+`storage::memory::MemoryStorage::new()` implements `storage::Storage`. Cloning a
+store shares its state. Entries expire by a monotonic clock and are cleaned on
+access and writes. Transaction upgrades never extend TTL or downgrade local
+execution confirmation. Execution claims, ownership checks, dispatch and atomic
+completion use the same lock. Expired leases can only be reclaimed before
+dispatch; completion is idempotent and preserves the execution record TTL.
+Missing/expired execution records, invalid ownership and invalid transitions
+return `StorageError::Conflict`. Reclaiming requires a fresh token and preserves
+the original record TTL; a repeated live claim by its owner preserves both TTLs.
+
+Memory storage is process-local and loses its state on restart. IDs are unique
+across stores within one process, but there is no cross-process coordination or
+restart persistence. The caller supplies finalized effects and independently
+verifies local execution, as required by the trait.
 
 ```sh
 cargo fmt --all -- --check

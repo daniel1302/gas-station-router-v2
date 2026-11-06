@@ -24,9 +24,13 @@ routing:
         - connect_error
   execute_tx:
     timeout: 30s
+    
+    inflight:
+      lease_ttl: 45s
+      record_ttl: 30m
   ttl:
     reservation: 15m
-    transaction_effects: 24h
+    transaction_effects: 30m
 
 backends:
   - name: gas_station_a

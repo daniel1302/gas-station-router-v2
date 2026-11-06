@@ -1,0 +1,354 @@
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    hash::Hash,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use async_trait::async_trait;
+use iota_sdk_types::TransactionDigest;
+use tokio::{sync::Mutex, time::Instant};
+
+use super::{
+    CachedTransaction, ExecutionClaim, ExecutionPhase, ExecutionRecord, ExecutionToken,
+    Reservation, ReservationId, Storage, StorageError, StorageResult, TransactionWriteOutcome,
+};
+
+// Do not reuse IDs between independent stores within the same process.
+static RESERVATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Process-local storage. Clones share all entries and execution leases.
+///
+/// Data is lost on restart. Independent processes do not share IDs or leases;
+/// use a shared persistent backend when running multiple router processes.
+/// Expired entries are removed on access and swept on writes; no worker is needed.
+#[derive(Clone, Default)]
+pub struct MemoryStorage {
+    state: Arc<Mutex<State>>,
+}
+
+#[derive(Default)]
+struct State {
+    reservations: HashMap<ReservationId, Expiring<Reservation>>,
+    transactions: HashMap<TransactionDigest, Expiring<CachedTransaction>>,
+    executions: HashMap<ReservationId, Expiring<Execution>>,
+}
+
+struct Expiring<T> {
+    value: T,
+    created_at: Instant,
+    ttl: Duration,
+}
+
+impl<T> Expiring<T> {
+    fn new(value: T, now: Instant, ttl: Duration) -> Self {
+        Self {
+            value,
+            created_at: now,
+            ttl,
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        // Comparing elapsed durations also supports TTLs too large for Instant + ttl.
+        now.duration_since(self.created_at) >= self.ttl
+    }
+}
+
+struct Execution {
+    record: ExecutionRecord,
+    token: ExecutionToken,
+    lease_started_at: Instant,
+    lease_ttl: Duration,
+}
+
+impl Execution {
+    fn lease_valid(&self, now: Instant) -> bool {
+        now.duration_since(self.lease_started_at) < self.lease_ttl
+    }
+}
+
+impl State {
+    fn purge_expired(&mut self, now: Instant) {
+        self.reservations.retain(|_, entry| !entry.expired(now));
+        self.transactions.retain(|_, entry| !entry.expired(now));
+        self.executions.retain(|_, entry| !entry.expired(now));
+    }
+}
+
+impl MemoryStorage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl Storage for MemoryStorage {
+    async fn create_reservation(
+        &self,
+        reservation: Reservation,
+        ttl: Duration,
+    ) -> StorageResult<ReservationId> {
+        validate_ttl(ttl)?;
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        state.purge_expired(now);
+        let id = next_reservation_id(&RESERVATION_SEQUENCE)?;
+        state
+            .reservations
+            .insert(id, Expiring::new(reservation, now, ttl));
+        Ok(id)
+    }
+
+    async fn get_reservation(&self, id: ReservationId) -> StorageResult<Option<Reservation>> {
+        let mut state = self.state.lock().await;
+        Ok(live_entry(&mut state.reservations, &id, Instant::now())
+            .map(|entry| entry.value.clone()))
+    }
+
+    async fn put_transaction(
+        &self,
+        digest: &TransactionDigest,
+        transaction: CachedTransaction,
+        ttl: Duration,
+    ) -> StorageResult<TransactionWriteOutcome> {
+        validate_ttl(ttl)?;
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        state.purge_expired(now);
+        write_transaction(&mut state.transactions, *digest, transaction, ttl, now)
+    }
+
+    async fn get_transaction(
+        &self,
+        digest: &TransactionDigest,
+    ) -> StorageResult<Option<CachedTransaction>> {
+        let mut state = self.state.lock().await;
+        Ok(live_entry(&mut state.transactions, digest, Instant::now())
+            .map(|entry| entry.value.clone()))
+    }
+
+    async fn health_check(&self) -> StorageResult<()> {
+        Ok(())
+    }
+
+    async fn try_claim_execution(
+        &self,
+        reservation_id: ReservationId,
+        digest: &TransactionDigest,
+        token: ExecutionToken,
+        lease_ttl: Duration,
+        record_ttl: Duration,
+    ) -> StorageResult<ExecutionClaim> {
+        validate_ttl(lease_ttl)?;
+        validate_ttl(record_ttl)?;
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        state.purge_expired(now);
+        match state.executions.entry(reservation_id) {
+            Entry::Vacant(entry) => {
+                entry.insert(Expiring::new(
+                    Execution {
+                        record: ExecutionRecord {
+                            digest: *digest,
+                            phase: ExecutionPhase::Claimed,
+                        },
+                        token,
+                        lease_started_at: now,
+                        lease_ttl,
+                    },
+                    now,
+                    record_ttl,
+                ));
+                Ok(ExecutionClaim::Acquired)
+            }
+            Entry::Occupied(mut entry) => {
+                let execution = &mut entry.get_mut().value;
+                if execution.record.digest != *digest {
+                    return Ok(ExecutionClaim::Conflict);
+                }
+                match execution.record.phase {
+                    ExecutionPhase::Dispatching => Ok(ExecutionClaim::PossiblySubmitted),
+                    ExecutionPhase::Completed => Ok(ExecutionClaim::Completed),
+                    ExecutionPhase::Claimed if execution.lease_valid(now) => {
+                        Ok(if execution.token == token {
+                            ExecutionClaim::Acquired
+                        } else {
+                            ExecutionClaim::InFlight
+                        })
+                    }
+                    ExecutionPhase::Claimed => {
+                        if execution.token == token {
+                            return Err(StorageError::Conflict);
+                        }
+                        execution.token = token;
+                        execution.lease_started_at = now;
+                        execution.lease_ttl = lease_ttl;
+                        // Reclaiming the lease does not extend the record's retention.
+                        Ok(ExecutionClaim::Acquired)
+                    }
+                }
+            }
+        }
+    }
+
+    async fn get_execution(
+        &self,
+        reservation_id: ReservationId,
+    ) -> StorageResult<Option<ExecutionRecord>> {
+        let mut state = self.state.lock().await;
+        Ok(
+            live_entry(&mut state.executions, &reservation_id, Instant::now())
+                .map(|entry| entry.value.record.clone()),
+        )
+    }
+
+    async fn mark_execution_dispatching(
+        &self,
+        reservation_id: ReservationId,
+        token: ExecutionToken,
+    ) -> StorageResult<()> {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        let entry = live_entry(&mut state.executions, &reservation_id, now)
+            .ok_or(StorageError::Conflict)?;
+        let execution = &mut entry.value;
+        if execution.token != token
+            || execution.record.phase != ExecutionPhase::Claimed
+            || !execution.lease_valid(now)
+        {
+            return Err(StorageError::Conflict);
+        }
+        execution.record.phase = ExecutionPhase::Dispatching;
+        Ok(())
+    }
+
+    async fn complete_execution(
+        &self,
+        reservation_id: ReservationId,
+        token: ExecutionToken,
+        transaction: CachedTransaction,
+        ttl: Duration,
+    ) -> StorageResult<TransactionWriteOutcome> {
+        validate_ttl(ttl)?;
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        state.purge_expired(now);
+        let State {
+            executions,
+            transactions,
+            ..
+        } = &mut *state;
+        let execution = &mut executions
+            .get_mut(&reservation_id)
+            .ok_or(StorageError::Conflict)?
+            .value;
+        if execution.token != token
+            || !matches!(
+                execution.record.phase,
+                ExecutionPhase::Dispatching | ExecutionPhase::Completed
+            )
+        {
+            return Err(StorageError::Conflict);
+        }
+        let outcome =
+            write_transaction(transactions, execution.record.digest, transaction, ttl, now)?;
+        execution.record.phase = ExecutionPhase::Completed;
+        Ok(outcome)
+    }
+
+    async fn cancel_execution(
+        &self,
+        reservation_id: ReservationId,
+        token: ExecutionToken,
+    ) -> StorageResult<()> {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        let execution = &live_entry(&mut state.executions, &reservation_id, now)
+            .ok_or(StorageError::Conflict)?
+            .value;
+        if execution.token != token
+            || execution.record.phase != ExecutionPhase::Claimed
+            || !execution.lease_valid(now)
+        {
+            return Err(StorageError::Conflict);
+        }
+        state.executions.remove(&reservation_id);
+        Ok(())
+    }
+}
+
+fn validate_ttl(ttl: Duration) -> StorageResult<()> {
+    if ttl.is_zero() {
+        Err(StorageError::InvalidTtl)
+    } else {
+        Ok(())
+    }
+}
+
+fn next_reservation_id(sequence: &AtomicU64) -> StorageResult<ReservationId> {
+    sequence
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map(|previous| previous + 1)
+        .map_err(|_| StorageError::IdExhausted)
+}
+
+fn live_entry<'a, K: Eq + Hash, T>(
+    entries: &'a mut HashMap<K, Expiring<T>>,
+    key: &K,
+    now: Instant,
+) -> Option<&'a mut Expiring<T>> {
+    if entries.get(key).is_some_and(|entry| entry.expired(now)) {
+        entries.remove(key);
+    }
+    entries.get_mut(key)
+}
+
+fn write_transaction(
+    entries: &mut HashMap<TransactionDigest, Expiring<CachedTransaction>>,
+    digest: TransactionDigest,
+    transaction: CachedTransaction,
+    ttl: Duration,
+    now: Instant,
+) -> StorageResult<TransactionWriteOutcome> {
+    match entries.entry(digest) {
+        Entry::Vacant(entry) => {
+            entry.insert(Expiring::new(transaction, now, ttl));
+            Ok(TransactionWriteOutcome::Inserted)
+        }
+        Entry::Occupied(mut entry) => {
+            let existing = &mut entry.get_mut().value;
+            if existing.effects != transaction.effects || existing.backend != transaction.backend {
+                return Err(StorageError::Conflict);
+            }
+            if transaction.local_execution_confirmed && !existing.local_execution_confirmed {
+                existing.local_execution_confirmed = true;
+                Ok(TransactionWriteOutcome::Upgraded)
+            } else {
+                Ok(TransactionWriteOutcome::Unchanged)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reservation_sequence_exhaustion_never_wraps() {
+        let sequence = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_reservation_id(&sequence).unwrap(), u64::MAX);
+        assert!(matches!(
+            next_reservation_id(&sequence),
+            Err(StorageError::IdExhausted)
+        ));
+        assert!(matches!(
+            next_reservation_id(&sequence),
+            Err(StorageError::IdExhausted)
+        ));
+    }
+}

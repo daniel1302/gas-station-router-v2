@@ -127,6 +127,16 @@ pub enum RetryOn {
 pub struct ExecuteTxConfig {
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    pub inflight: InflightConfig,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct InflightConfig {
+    #[serde(with = "humantime_serde")]
+    pub lease_ttl: Duration,
+    #[serde(with = "humantime_serde")]
+    pub record_ttl: Duration,
 }
 
 #[derive(Deserialize)]
