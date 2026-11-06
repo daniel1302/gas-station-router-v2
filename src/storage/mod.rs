@@ -18,6 +18,53 @@ pub type StorageResult<T> = Result<T, StorageError>;
 /// router's execution state.
 pub type ExecutionToken = Uuid;
 
+/// ExecutionPhase - transaction life cycle
+///
+/// ```text
+///                       execute_tx
+///                           |
+///                           v
+///                +--------------------+
+///                | No execution record|
+///                +--------------------+
+///                           |
+///                           | try_claim_execution()
+///                           v
+///                +--------------------+
+///                |      CLAIMED       |
+///                |--------------------|
+///                | Router owns lease  |
+///                | Request NOT sent   |
+///                +--------------------+
+///                     |          |
+///       lease expired |          | mark_execution_dispatching()
+///       or cancel     |          |
+///                     v          v
+///                +--------------------+
+///                |    DISPATCHING     |
+///                |--------------------|
+///                | May be submitted   |
+///                | to Gas Station     |
+///                +--------------------+
+///                           |
+///                           | execute_tx HTTP request
+///                           v
+///                  +------------------+
+///                  |   Gas Station    |
+///                  |                  |
+///                  |  IOTA Full Node  |
+///                  +------------------+
+///                           |
+///                           | Response: TransactionEffects
+///                           v
+///                +--------------------+
+///                |     COMPLETED      |
+///                |--------------------|
+///                | Effects cached     |
+///                | Transaction done   |
+///                +--------------------+
+/// ```
+///
 /// Current state of transaction execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionPhase {
@@ -46,6 +93,50 @@ pub struct ExecutionRecord {
     pub phase: ExecutionPhase,
 }
 
+/// ExecutionClaim lifecycle
+///
+/// ```text
+///              Router A / Router B
+///                       |
+///                       | execute_tx(reservation_id, digest)
+///                       v
+///             +----------------------+
+///             |        Redis         |
+///             | try_claim_execution()|
+///             +----------------------+
+///                       |
+///          +------------+-------------+
+///          |                          |
+///          v                          v
+///    No record exists           Record exists
+///          |                          |
+///          v                          v
+///    +------------+            Check execution
+///    |  ACQUIRED  |                  |
+///    +------------+                  |
+///          |                         |
+///          v          +--------------+--------------+
+///    Create CLAIMED   |              |              |
+///                      v              v              v
+///                   CLAIMED       DISPATCHING     COMPLETED
+///                      |              |              |
+///                +-----+-----+        |              |
+///                |           |        |              |
+///                v           v        v              v
+///           Lease valid   Expired  POSSIBLY_      COMPLETED
+///                |           |     SUBMITTED
+///                v           v        |              |
+///             IN_FLIGHT   ACQUIRED    |              |
+///                |           |        |              |
+///                v           v        v              v
+///              Wait       Reclaim   Recovery      Read cache
+///
+///    Different digest for existing reservation:
+///                     |
+///                     v
+///                  CONFLICT
+/// ```
+///
 /// Result of trying to claim a reservation for execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionClaim {
