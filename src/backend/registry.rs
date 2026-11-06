@@ -18,7 +18,7 @@ use tokio::{
     time::{MissedTickBehavior, interval},
 };
 
-use crate::{config::BackendConfig, routing::BackendCandidate};
+use crate::{config::BackendConfig, metrics, routing::BackendCandidate};
 
 pub struct BackendRegistry {
     backends: Vec<Arc<Backend>>,
@@ -80,7 +80,8 @@ impl BackendRegistry {
     }
 
     pub fn candidates(&self, excluded: &HashSet<String>) -> Vec<BackendCandidate> {
-        self.backends
+        let candidates: Vec<_> = self
+            .backends
             .iter()
             .filter(|backend| {
                 backend.enabled
@@ -92,7 +93,9 @@ impl BackendRegistry {
                 weight: 1,
                 inflight: backend.inflight.load(Ordering::Relaxed),
             })
-            .collect()
+            .collect();
+        metrics::set_backend_registry_candidates(candidates.len());
+        candidates
     }
 
     /// Allows health monitoring to update a backend without changing routing policy.

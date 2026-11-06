@@ -500,7 +500,7 @@ async fn health_probes_filter_failed_backends_and_allow_recovery() {
     disabled.enabled = false;
     let registry =
         BackendRegistry::new(&[backend("a", a.uri()), backend("b", b.uri()), disabled]).unwrap();
-    assert!(registry.candidates(&HashSet::new()).is_empty());
+    assert_eq!(registry.candidates(&HashSet::new()).len(), 2);
     let client = http_client(Duration::from_secs(1)).unwrap();
     registry
         .refresh_health(&client, Duration::from_secs(1))

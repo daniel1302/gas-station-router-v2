@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use crate::metrics;
 use async_trait::async_trait;
 use iota_sdk_types::TransactionDigest;
 use tokio::{sync::Mutex, time::Instant};
@@ -92,6 +93,7 @@ impl Storage for MemoryStorage {
         reservation: Reservation,
         ttl: Duration,
     ) -> StorageResult<ReservationId> {
+        metrics::inc_storage_call("create_reservation");
         validate_ttl(ttl)?;
         let mut state = self.state.lock().await;
         let now = Instant::now();
@@ -104,6 +106,7 @@ impl Storage for MemoryStorage {
     }
 
     async fn get_reservation(&self, id: ReservationId) -> StorageResult<Option<Reservation>> {
+        metrics::inc_storage_call("get_reservation");
         let mut state = self.state.lock().await;
         Ok(live_entry(&mut state.reservations, &id, Instant::now())
             .map(|entry| entry.value.clone()))
@@ -115,6 +118,7 @@ impl Storage for MemoryStorage {
         transaction: CachedTransaction,
         ttl: Duration,
     ) -> StorageResult<TransactionWriteOutcome> {
+        metrics::inc_storage_call("put_transaction");
         validate_ttl(ttl)?;
         let mut state = self.state.lock().await;
         let now = Instant::now();
@@ -126,12 +130,15 @@ impl Storage for MemoryStorage {
         &self,
         digest: &TransactionDigest,
     ) -> StorageResult<Option<CachedTransaction>> {
+        metrics::inc_storage_call("get_transaction");
         let mut state = self.state.lock().await;
         Ok(live_entry(&mut state.transactions, digest, Instant::now())
             .map(|entry| entry.value.clone()))
     }
 
     async fn health_check(&self) -> StorageResult<()> {
+        metrics::inc_storage_call("health_check");
+        metrics::inc_storage_health(true);
         Ok(())
     }
 
@@ -143,6 +150,7 @@ impl Storage for MemoryStorage {
         lease_ttl: Duration,
         record_ttl: Duration,
     ) -> StorageResult<ExecutionClaim> {
+        metrics::inc_storage_call("try_claim_execution");
         validate_ttl(lease_ttl)?;
         validate_ttl(record_ttl)?;
         let mut state = self.state.lock().await;
@@ -163,18 +171,19 @@ impl Storage for MemoryStorage {
                     now,
                     record_ttl,
                 ));
-                Ok(ExecutionClaim::Acquired)
+                metrics::inc_storage_execution_phase("claimed");
+                claim_result(ExecutionClaim::Acquired)
             }
             Entry::Occupied(mut entry) => {
                 let execution = &mut entry.get_mut().value;
                 if execution.record.digest != *digest {
-                    return Ok(ExecutionClaim::Conflict);
+                    return claim_result(ExecutionClaim::Conflict);
                 }
                 match execution.record.phase {
-                    ExecutionPhase::Dispatching => Ok(ExecutionClaim::PossiblySubmitted),
-                    ExecutionPhase::Completed => Ok(ExecutionClaim::Completed),
+                    ExecutionPhase::Dispatching => claim_result(ExecutionClaim::PossiblySubmitted),
+                    ExecutionPhase::Completed => claim_result(ExecutionClaim::Completed),
                     ExecutionPhase::Claimed if execution.lease_valid(now) => {
-                        Ok(if execution.token == token {
+                        claim_result(if execution.token == token {
                             ExecutionClaim::Acquired
                         } else {
                             ExecutionClaim::InFlight
@@ -182,13 +191,13 @@ impl Storage for MemoryStorage {
                     }
                     ExecutionPhase::Claimed => {
                         if execution.token == token {
-                            return Err(StorageError::Conflict);
+                            return Err(conflict());
                         }
                         execution.token = token;
                         execution.lease_started_at = now;
                         execution.lease_ttl = lease_ttl;
                         // Reclaiming the lease does not extend the record's retention.
-                        Ok(ExecutionClaim::Acquired)
+                        claim_result(ExecutionClaim::Acquired)
                     }
                 }
             }
@@ -199,6 +208,7 @@ impl Storage for MemoryStorage {
         &self,
         reservation_id: ReservationId,
     ) -> StorageResult<Option<ExecutionRecord>> {
+        metrics::inc_storage_call("get_execution");
         let mut state = self.state.lock().await;
         Ok(
             live_entry(&mut state.executions, &reservation_id, Instant::now())
@@ -211,18 +221,19 @@ impl Storage for MemoryStorage {
         reservation_id: ReservationId,
         token: ExecutionToken,
     ) -> StorageResult<()> {
+        metrics::inc_storage_call("mark_execution_dispatching");
         let mut state = self.state.lock().await;
         let now = Instant::now();
-        let entry = live_entry(&mut state.executions, &reservation_id, now)
-            .ok_or(StorageError::Conflict)?;
+        let entry = live_entry(&mut state.executions, &reservation_id, now).ok_or_else(conflict)?;
         let execution = &mut entry.value;
         if execution.token != token
             || execution.record.phase != ExecutionPhase::Claimed
             || !execution.lease_valid(now)
         {
-            return Err(StorageError::Conflict);
+            return Err(conflict());
         }
         execution.record.phase = ExecutionPhase::Dispatching;
+        metrics::inc_storage_execution_phase("dispatching");
         Ok(())
     }
 
@@ -233,6 +244,7 @@ impl Storage for MemoryStorage {
         transaction: CachedTransaction,
         ttl: Duration,
     ) -> StorageResult<TransactionWriteOutcome> {
+        metrics::inc_storage_call("complete_execution");
         validate_ttl(ttl)?;
         let mut state = self.state.lock().await;
         let now = Instant::now();
@@ -244,7 +256,7 @@ impl Storage for MemoryStorage {
         } = &mut *state;
         let execution = &mut executions
             .get_mut(&reservation_id)
-            .ok_or(StorageError::Conflict)?
+            .ok_or_else(conflict)?
             .value;
         if execution.token != token
             || !matches!(
@@ -252,11 +264,14 @@ impl Storage for MemoryStorage {
                 ExecutionPhase::Dispatching | ExecutionPhase::Completed
             )
         {
-            return Err(StorageError::Conflict);
+            return Err(conflict());
         }
         let outcome =
             write_transaction(transactions, execution.record.digest, transaction, ttl, now)?;
-        execution.record.phase = ExecutionPhase::Completed;
+        if execution.record.phase != ExecutionPhase::Completed {
+            execution.record.phase = ExecutionPhase::Completed;
+            metrics::inc_storage_execution_phase("completed");
+        }
         Ok(outcome)
     }
 
@@ -265,16 +280,17 @@ impl Storage for MemoryStorage {
         reservation_id: ReservationId,
         token: ExecutionToken,
     ) -> StorageResult<()> {
+        metrics::inc_storage_call("cancel_execution");
         let mut state = self.state.lock().await;
         let now = Instant::now();
         let execution = &live_entry(&mut state.executions, &reservation_id, now)
-            .ok_or(StorageError::Conflict)?
+            .ok_or_else(conflict)?
             .value;
         if execution.token != token
             || execution.record.phase != ExecutionPhase::Claimed
             || !execution.lease_valid(now)
         {
-            return Err(StorageError::Conflict);
+            return Err(conflict());
         }
         state.executions.remove(&reservation_id);
         Ok(())
@@ -283,6 +299,7 @@ impl Storage for MemoryStorage {
 
 fn validate_ttl(ttl: Duration) -> StorageResult<()> {
     if ttl.is_zero() {
+        metrics::inc_storage_error("invalid_ttl");
         Err(StorageError::InvalidTtl)
     } else {
         Ok(())
@@ -293,7 +310,10 @@ fn next_reservation_id(sequence: &AtomicU64) -> StorageResult<ReservationId> {
     sequence
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .map(|previous| previous + 1)
-        .map_err(|_| StorageError::IdExhausted)
+        .map_err(|_| {
+            metrics::inc_storage_error("id_exhausted");
+            StorageError::IdExhausted
+        })
 }
 
 fn live_entry<'a, K: Eq + Hash, T>(
@@ -316,13 +336,14 @@ fn write_transaction(
 ) -> StorageResult<TransactionWriteOutcome> {
     match entries.entry(digest) {
         Entry::Vacant(entry) => {
-            entry.insert(Expiring::new(transaction, now, ttl));
+            let entry = entry.insert(Expiring::new(transaction, now, ttl));
+            metrics::inc_storage_cached_transactions(&entry.value.backend);
             Ok(TransactionWriteOutcome::Inserted)
         }
         Entry::Occupied(mut entry) => {
             let existing = &mut entry.get_mut().value;
             if existing.effects != transaction.effects || existing.backend != transaction.backend {
-                return Err(StorageError::Conflict);
+                return Err(conflict());
             }
             if transaction.local_execution_confirmed && !existing.local_execution_confirmed {
                 existing.local_execution_confirmed = true;
@@ -332,6 +353,22 @@ fn write_transaction(
             }
         }
     }
+}
+
+fn conflict() -> StorageError {
+    metrics::inc_storage_error("conflict");
+    StorageError::Conflict
+}
+
+fn claim_result(claim: ExecutionClaim) -> StorageResult<ExecutionClaim> {
+    metrics::inc_storage_execution_claim(match claim {
+        ExecutionClaim::Acquired => "acquired",
+        ExecutionClaim::InFlight => "in_flight",
+        ExecutionClaim::PossiblySubmitted => "possibly_submitted",
+        ExecutionClaim::Completed => "completed",
+        ExecutionClaim::Conflict => "conflict",
+    });
+    Ok(claim)
 }
 
 #[cfg(test)]

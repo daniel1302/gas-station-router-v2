@@ -14,6 +14,7 @@ use tokio::{net::TcpListener, sync::watch};
 use crate::{
     backend::registry::BackendRegistry,
     config::{Config, RoutingAlgorithm, StorageKind},
+    metrics,
     reserve::{self, ReserveGasRequest, ReserveReply, ReserveService},
     routing::round_robin::RoundRobinSelector,
     storage::{Storage, memory::MemoryStorage},
@@ -59,7 +60,7 @@ pub async fn start(config: Config) -> Result<()> {
             .context("RPC server failed")
     };
     let metrics_server = async {
-        axum::serve(metrics, metrics_routes())
+        axum::serve(metrics, metrics::router())
             .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
             .await
             .context("metrics server failed")
@@ -93,6 +94,7 @@ async fn reserve_gas(
     headers: HeaderMap,
     request: Result<Json<ReserveGasRequest>, JsonRejection>,
 ) -> Response {
+    metrics::inc_reserve_gas();
     if !state.token.is_empty()
         && headers
             .get(AUTHORIZATION)
@@ -115,24 +117,15 @@ async fn reserve_gas(
 }
 
 fn reserve_response(reply: ReserveReply) -> Response {
+    if !reply.status.is_success()
+        || reply
+            .body
+            .get("error")
+            .is_some_and(|error| !error.is_null())
+    {
+        metrics::inc_reserve_gas_error();
+    }
     (reply.status, Json(reply.body)).into_response()
-}
-
-fn metrics_routes() -> Router {
-    Router::new().route(
-        "/metrics",
-        get(|| async {
-            (
-                [(
-                    axum::http::header::CONTENT_TYPE,
-                    "text/plain; version=0.0.4; charset=utf-8",
-                )],
-                "# HELP gas_station_router_up Whether the router HTTP servers are running.\n\
-             # TYPE gas_station_router_up gauge\n\
-             gas_station_router_up 1\n",
-            )
-        }),
-    )
 }
 
 async fn not_implemented() -> (StatusCode, Json<Value>) {
