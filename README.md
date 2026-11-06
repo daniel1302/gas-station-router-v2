@@ -54,7 +54,7 @@ extra response fields are preserved. Only a successful `result.reservation_id`
 is replaced; storage retains the original ID and backend name for execution.
 The mapping uses `routing.ttl.reservation`.
 
-The backend registry starts with unknown/unhealthy backends. It probes each
+The backend registry initially treats enabled backends as healthy. It probes each
 enabled backend's base RPC URL (`GET /` for a normal Gas Station) at startup and
 every five seconds, with `routing.reserve_gas.timeout`. A 2xx response makes the
 backend eligible; this is an HTTP health check, not an execution canary. Set
@@ -86,6 +86,35 @@ Memory storage is process-local and loses its state on restart. IDs are unique
 across stores within one process, but there is no cross-process coordination or
 restart persistence. The caller supplies finalized effects and independently
 verifies local execution, as required by the trait.
+
+Metrics are process-wide and initialized on first use with `std::sync::LazyLock`.
+The `prometheus` library provides atomic integer counters and text encoding.
+The metrics module owns no storage instances; `/metrics` only gathers static
+collectors. Scraping never calls storage or probes dependencies. Fixed labels
+use bounded method/outcome/error names; backend labels use configured names,
+never tokens, RPC URLs, reservation IDs or transaction digests.
+
+All names below have the prefix `gas_station_router_`:
+
+| Name | Labels | Meaning |
+| --- | --- | --- |
+| `storage_execution_phase_transitions_total` | `kind` | Entry into `claimed`, `dispatching`, `completed`; idempotent calls do not add transitions. |
+| `storage_execution_claims_total` | `kind` | Claim results: `acquired`, `in_flight`, `possibly_submitted`, `completed`, `conflict`. |
+| `storage_cached_transactions_total` | `backend` | New cache inserts, including inserts after TTL expiry; reads and upgrades are excluded. |
+| `storage_errors_total` | `kind` | Storage `Err` results: `backend`, `invalid_ttl`, `id_exhausted`, `conflict`. |
+| `storage_calls_total` | `method` | All storage method calls, including `health_check` and failed calls. |
+| `storage_health_checks_total` | `kind` | `healthy` / `unhealthy` health check outcomes. |
+| `backend_selector_calls_total` | `algorithm`, `backend_name` | Each selection, including retries; empty backend name means no candidate was selected. |
+| `backend_registry_candidates` | none | Gauge: the latest candidate count after enabled/health/retry filtering. |
+| `reserve_gas_requests_total` | none | Incoming reserve HTTP calls, including auth/validation rejections; retries do not add requests. |
+| `reserve_gas_errors_total` | none | Failed client responses, once per call; includes business errors returned with HTTP 200. |
+
+These storage counters describe events, not live cache sizes or current phase
+populations. `storage_health_checks_total` is a result counter, not a health
+gauge. A claim conflict is an ordinary claim outcome; it increments
+`storage_errors_total` only when an operation actually returns `Err`.
+The existing `gas_station_router_up` gauge is also retained. Backend label series
+appear on first use; fixed label sets are initialized to zero.
 
 ```sh
 cargo fmt --all -- --check

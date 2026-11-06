@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, sync::Mutex};
 
 use super::{BackendCandidate, BackendSelector};
+use crate::metrics;
 
 /// Rotates backend names, so filtering a failed backend does not skip its peer.
 #[derive(Default)]
@@ -16,6 +17,19 @@ impl RoundRobinSelector {
 
 impl BackendSelector for RoundRobinSelector {
     fn select(&self, candidates: &[BackendCandidate]) -> Option<usize> {
+        let selected = self.select_candidate(candidates);
+        metrics::inc_backend_selector_call(
+            "round_robin",
+            selected
+                .and_then(|index| candidates.get(index))
+                .map(|backend| backend.name.as_str()),
+        );
+        selected
+    }
+}
+
+impl RoundRobinSelector {
+    fn select_candidate(&self, candidates: &[BackendCandidate]) -> Option<usize> {
         if candidates.is_empty() {
             return None;
         }
