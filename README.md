@@ -1,9 +1,10 @@
 # Gas Station Router v2
 
 Minimal Rust service with a YAML config, a Clap CLI, separate RPC and metrics
-HTTP servers and an in-memory implementation of the storage trait. RPC handlers
-are still dummy handlers: routing, authentication and storage integration are not
-implemented yet. Startup does not connect to Redis or the backends.
+HTTP servers and an in-memory implementation of the storage trait.
+`POST /v1/reserve_gas` routes reservations to enabled, healthy backends and stores
+the mapping before returning a router-generated reservation ID. Transaction
+execution is still a dummy handler.
 
 ```sh
 cargo run -- init                       # YAML on stdout
@@ -18,30 +19,58 @@ cargo run -- start --config-file config.yaml
 ```
 
 See [config.example.yaml](config.example.yaml) for the complete config. `start`
-requires `--config-file`. The `memory` storage kind can omit the `redis` section;
-the `redis` kind requires it.
+requires `--config-file`. Use `storage.kind: memory`; Redis storage is not
+implemented yet and selecting it fails startup. The `memory` kind can omit the
+`redis` section. All environment references present in the file are resolved,
+including those in an unused Redis section.
 
 The RPC token, IOTA RPC URL, Redis URL, backend tokens and backend RPC URLs accept
-whole-value environment references: `${NAME}` or `$NAME`. Other values are used literally.
+whole-value environment references: `${NAME}` or `$NAME`. Other values are used
+literally.
 Missing variables fail config loading. Substitution happens after YAML parsing,
 so environment values containing YAML syntax are preserved as strings. `init`
 keeps the placeholders and does not require environment variables.
 
 Durations use human-readable strings such as `3s`, `200ms`, `15m` and `24h`.
-Unknown config fields are rejected. The example mirrors the proposed backend
-addresses; backend A currently shares the router's default port, so change that
-address before implementing forwarding.
+Unknown config fields are rejected. Backend RPC ports must differ from the
+router's port when running on the same host.
 
-| Listener | Method | Path | Dummy response |
+| Listener | Method | Path | Response |
 | --- | --- | --- | --- |
 | RPC (`0.0.0.0:9257`) | GET | `/health` | `200`, `{"status":"ok"}` |
-| RPC | POST | `/v1/reserve_gas` | `501`, `{"error":"not implemented"}` |
+| RPC | POST | `/v1/reserve_gas` | Gas Station response with a router reservation ID |
 | RPC | POST | `/v1/execute_transaction` | `501`, `{"error":"not implemented"}` |
 | Metrics (`0.0.0.0:9184`) | GET | `/metrics` | Prometheus text, `gas_station_router_up 1` |
 
 The config key is `routing.execute_tx`; the HTTP path is
 `/v1/execute_transaction`. Both listeners bind before serving. SIGINT and SIGTERM
 gracefully stop both servers.
+
+Reservations accept `{"gas_budget": 1000000, "reserve_duration_secs": 60}`.
+When `rpc.token` is nonempty, this endpoint requires `Authorization: Bearer <token>`.
+The upstream receives its own configured backend token, not the client's token.
+The Gas Station response envelope (`result` / `error`), sponsor, gas coins and
+extra response fields are preserved. Only a successful `result.reservation_id`
+is replaced; storage retains the original ID and backend name for execution.
+The mapping uses `routing.ttl.reservation`.
+
+The backend registry starts with unknown/unhealthy backends. It probes each
+enabled backend's base RPC URL (`GET /` for a normal Gas Station) at startup and
+every five seconds, with `routing.reserve_gas.timeout`. A 2xx response makes the
+backend eligible; this is an HTTP health check, not an execution canary. Set
+`enabled: false` on a backend to exclude it from probes and new reservations;
+omitting `enabled` defaults to true. Selection is round robin and performs no
+network or storage I/O. Candidate `inflight` counts active backend requests.
+
+`max_retries` counts additional attempts after the first. Only configured
+`connect_error` failures trigger another selection, after `backoff`; failed
+backends are excluded for the rest of that request and marked unhealthy until
+a successful probe. The timeout is per HTTP attempt, including the response body.
+Timeouts, interrupted/malformed responses, HTTP/business errors and storage write
+failures do not retry. Redirects and the HTTP client's automatic retries are
+disabled. No eligible backend or a failed mapping write returns 503; exhausted
+connection errors return 502 and timeouts return 504. A storage failure returns
+no reservation to the client; upstream reservations then expire normally.
 
 `storage::memory::MemoryStorage::new()` implements `storage::Storage`. Cloning a
 store shares its state. Entries expire by a monotonic clock and are cleaned on

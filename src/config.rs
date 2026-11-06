@@ -162,10 +162,16 @@ pub struct TtlConfig {
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
     pub name: String,
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
     #[serde(default, deserialize_with = "env_string")]
     pub token: String,
     #[serde(deserialize_with = "env_string")]
     pub rpc: String,
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 fn env_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
