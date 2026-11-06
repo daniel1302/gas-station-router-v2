@@ -15,8 +15,8 @@ use axum::{
 };
 use gas_station_router_v2::{
     api,
-    backend::registry::BackendRegistry,
-    config::{BackendConfig, ReserveGasConfig, RetryConfig},
+    backend::{health::BackgroundHealthChecker, registry::BackendRegistry},
+    config::{BackendConfig, HealthChecksConfig, ReserveGasConfig, RetryConfig},
     routing::{BackendCandidate, BackendSelector, round_robin::RoundRobinSelector},
     services::reservation::{ReservationService, ReserveError, http_client},
     storage::{
@@ -638,13 +638,20 @@ async fn health_probes_filter_failed_backends_and_allow_recovery() {
         .await;
     let mut disabled = backend("c", c.uri());
     disabled.enabled = false;
-    let registry =
-        BackendRegistry::new(&[backend("a", a.uri()), backend("b", b.uri()), disabled]).unwrap();
+    let registry = Arc::new(
+        BackendRegistry::new(&[backend("a", a.uri()), backend("b", b.uri()), disabled]).unwrap(),
+    );
     assert_eq!(registry.candidates(&HashSet::new()).len(), 2);
-    let client = http_client(Duration::from_secs(1)).unwrap();
-    registry
-        .refresh_health(&client, Duration::from_secs(1))
-        .await;
+    let checker = BackgroundHealthChecker::new(
+        registry.clone(),
+        HealthChecksConfig {
+            unhealthy_threshold: 1,
+            healthy_threshold: 1,
+            ..HealthChecksConfig::default()
+        },
+    )
+    .unwrap();
+    checker.check_once().await.unwrap();
     assert_eq!(
         registry
             .candidates(&HashSet::new())
@@ -660,9 +667,7 @@ async fn health_probes_filter_failed_backends_and_allow_recovery() {
         .expect(1)
         .mount(&b)
         .await;
-    registry
-        .refresh_health(&client, Duration::from_secs(1))
-        .await;
+    checker.check_once().await.unwrap();
     assert_eq!(
         registry
             .candidates(&HashSet::new())

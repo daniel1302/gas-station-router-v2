@@ -1,0 +1,18 @@
+# Template rendered inside each container. Keys only live in .env and tmpfs.
+signer-config:
+  local:
+    keypair: "${GAS_STATION_PRIVATE_KEY}"
+rpc-host-ip: 0.0.0.0
+rpc-port: 9527
+metrics-port: 9184
+storage-config:
+  redis:
+    redis-url: "redis://redis:6379/${REDIS_DB}"
+fullnode-url: "${IOTA_GRPC_URL}"
+coin-init-config:
+  target-init-balance: 100000000
+  refresh-interval-sec: 30
+daily-gas-usage-cap: 100000000000
+max-gas-budget: 50000000
+access-controller:
+  access-policy: disabled

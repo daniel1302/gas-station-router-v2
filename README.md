@@ -6,6 +6,10 @@ HTTP servers and an in-memory implementation of the storage trait.
 the mapping before returning a router-generated reservation ID. Transaction
 execution is still a dummy handler.
 
+Local Redis + three Gas Stations and incremental Rust e2e tests:
+[docker/README.md](docker/README.md). The `reserve` test works with the current
+router; `transactions` explicitly fails until execution is implemented.
+
 `api` contains HTTP routing and handlers (`health`, `reservation`, `execution`).
 `services::reservation::ReservationService` owns reservation selection, retry
 policy and mapping storage. `services::execution::ExecutionService` is a
@@ -72,13 +76,31 @@ extra response fields are preserved. Only a successful `result.reservation_id`
 is replaced; storage retains the original ID and backend name for execution.
 The mapping uses `routing.ttl.reservation`.
 
-The backend registry initially treats enabled backends as healthy. It probes each
-enabled backend's base RPC URL (`GET /` for a normal Gas Station) at startup and
-every five seconds, with `routing.reserve_gas.timeout`. A 2xx response makes the
-backend eligible; this is an HTTP health check, not an execution canary. Set
+The backend registry initially treats enabled backends as healthy.
+`backend::health::BackgroundHealthChecker` runs as a separate Tokio task, with
+parallel `GET /` probes of enabled Gas Stations. The first round starts immediately,
+then repeats at `health_checks.interval` (default `5s`). Each probe uses
+`health_checks.timeout` (default `1500ms`), independently of reservation timeouts.
+HTTP `200` is a success; other statuses, connection errors and timeouts are failures.
+Probes do not follow redirects or retry automatically.
+
+Counters track consecutive outcomes per backend. A success resets failures;
+a failure resets successes. After `unhealthy_threshold` failures (default `3`)
+the backend is excluded from new reservations. After `healthy_threshold` successes
+(default `2`) it becomes eligible again. Probing continues for unhealthy backends.
+Health changes do not remove existing reservation mappings. Each backend has its
+own worker and schedule, so a slow node cannot delay other nodes' probes. Probes
+for the same backend do not overlap and missed interval ticks are skipped.
+Shutdown cancels every worker and its outstanding probe.
+
+`health_checks.enabled: false` disables the background checker. Set
 `enabled: false` on a backend to exclude it from probes and new reservations;
-omitting `enabled` defaults to true. Selection is round robin and performs no
-network or storage I/O. Candidate `inflight` counts active backend requests.
+omitting that backend option defaults to true. Omitting `health_checks` uses the
+example config's defaults. Enabled checks require nonzero intervals, timeouts and
+thresholds. The `passive` and `deep_check` settings are reserved for future work;
+the existing immediate exclusion after a reservation connection failure is retained.
+Selection is round robin and performs no network or storage I/O. Candidate
+`inflight` counts active reservation requests, excluding health probes.
 
 The HTTP handler in `api::reservation` calls
 `ReservationService::reserve_with_retry()` for selection, retries and mapping

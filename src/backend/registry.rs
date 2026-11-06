@@ -1,24 +1,18 @@
 use std::{
     collections::HashSet,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
 };
 
+use super::health::HealthState;
+use crate::{config::BackendConfig, metrics, routing::BackendCandidate};
 use anyhow::{Context, Result, ensure};
 use reqwest::{
     Client, RequestBuilder, Url,
     header::{AUTHORIZATION, HeaderValue},
 };
-use tokio::{
-    sync::watch,
-    task::JoinSet,
-    time::{MissedTickBehavior, interval},
-};
-
-use crate::{config::BackendConfig, metrics, routing::BackendCandidate};
 
 pub struct BackendRegistry {
     backends: Vec<Arc<Backend>>,
@@ -29,7 +23,7 @@ pub(crate) struct Backend {
     url: Url,
     authorization: Option<HeaderValue>,
     enabled: bool,
-    healthy: AtomicBool,
+    health: Mutex<HealthState>,
     inflight: AtomicUsize,
 }
 
@@ -72,7 +66,7 @@ impl BackendRegistry {
                 url,
                 authorization,
                 enabled: config.enabled,
-                healthy: AtomicBool::new(true),
+                health: Mutex::new(HealthState::new()),
                 inflight: AtomicUsize::new(0),
             }));
         }
@@ -85,7 +79,11 @@ impl BackendRegistry {
             .iter()
             .filter(|backend| {
                 backend.enabled
-                    && backend.healthy.load(Ordering::Relaxed)
+                    && backend
+                        .health
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .is_healthy()
                     && !excluded.contains(&backend.name)
             })
             .map(|backend| BackendCandidate {
@@ -101,7 +99,11 @@ impl BackendRegistry {
     /// Allows health monitoring to update a backend without changing routing policy.
     pub fn set_healthy(&self, name: &str, healthy: bool) -> bool {
         if let Some(backend) = self.get(name) {
-            backend.healthy.store(healthy, Ordering::Relaxed);
+            backend
+                .health
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .set_healthy(healthy);
             true
         } else {
             false
@@ -115,46 +117,35 @@ impl BackendRegistry {
             .cloned()
     }
 
-    /// Probe each enabled backend's base URL (GET / for a normal Gas Station).
-    pub async fn refresh_health(&self, client: &Client, timeout: Duration) {
-        let mut checks = JoinSet::new();
-        for backend in self.backends.iter().filter(|backend| backend.enabled) {
-            let backend = backend.clone();
-            let client = client.clone();
-            checks.spawn(async move {
-                let response = backend
-                    .authorize(client.get(backend.url.clone()))
-                    .timeout(timeout)
-                    .send()
-                    .await;
-                backend.healthy.store(
-                    response.is_ok_and(|response| response.status().is_success()),
-                    Ordering::Relaxed,
-                );
-            });
-        }
-        while checks.join_next().await.is_some() {}
-    }
-
-    pub(crate) async fn monitor_health(
-        &self,
-        client: Client,
-        timeout: Duration,
-        mut shutdown: watch::Receiver<()>,
-    ) -> Result<()> {
-        let mut ticks = interval(Duration::from_secs(5));
-        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        ticks.tick().await; // Startup already performed the initial probe.
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => return Ok(()),
-                _ = ticks.tick() => self.refresh_health(&client, timeout).await,
-            }
-        }
+    pub(crate) fn enabled_backends(&self) -> impl Iterator<Item = Arc<Backend>> + '_ {
+        self.backends
+            .iter()
+            .filter(|backend| backend.enabled)
+            .cloned()
     }
 }
 
 impl Backend {
+    pub(super) fn health_request(&self, client: &Client) -> RequestBuilder {
+        self.authorize(client.get(self.url.clone()))
+    }
+
+    pub(super) fn record_health_result(
+        &self,
+        success: bool,
+        healthy_threshold: u32,
+        unhealthy_threshold: u32,
+    ) {
+        let transition = self
+            .health
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record(success, healthy_threshold, unhealthy_threshold);
+        if let Some(healthy) = transition {
+            tracing::info!(backend = %self.name, healthy, "Backend health changed");
+        }
+    }
+
     fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
         match &self.authorization {
             Some(value) => request.header(AUTHORIZATION, value.clone()),
