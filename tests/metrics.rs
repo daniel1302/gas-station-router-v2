@@ -7,12 +7,12 @@ use axum::{
     http::{Request, StatusCode},
 };
 use gas_station_router_v2::{
+    api,
     backend::registry::BackendRegistry,
-    config::{BackendConfig, ReserveGasConfig, RetryConfig, RetryOn},
+    config::{BackendConfig, ReserveGasConfig, RetryConfig},
     metrics,
-    reserve::{ReserveService, http_client},
     routing::round_robin::RoundRobinSelector,
-    server::rpc_routes,
+    services::reservation::{ReservationService, http_client},
     storage::{
         CachedTransaction, ExecutionClaim, ExecutionPhase, Reservation, Storage, StorageError,
         memory::MemoryStorage,
@@ -350,7 +350,7 @@ async fn reservation_metrics() {
     ];
     let registry = Arc::new(BackendRegistry::new(&configs).unwrap());
     let client = http_client(Duration::from_secs(1)).unwrap();
-    let service = ReserveService::new(
+    let service = ReservationService::new(
         registry.clone(),
         Arc::new(RoundRobinSelector::new()),
         Arc::new(MemoryStorage::new()),
@@ -360,13 +360,12 @@ async fn reservation_metrics() {
             retries: RetryConfig {
                 max_retries: 1,
                 backoff: Duration::ZERO,
-                retry_on: vec![RetryOn::ConnectError],
             },
         },
         Duration::from_secs(900),
     )
     .unwrap();
-    let router = rpc_routes(Arc::new(service), "client-token".into());
+    let router = api::router(Arc::new(service), "client-token".into());
     let payload = json!({"gas_budget":1000000,"reserve_duration_secs":60});
     assert_eq!(
         send(router.clone(), payload.clone(), false).await,
@@ -469,7 +468,7 @@ async fn reservation_metrics() {
             "backend_selector_calls_total",
             "algorithm=\"round_robin\",backend_name=\"\""
         ),
-        1
+        2
     );
     assert_eq!(
         count(

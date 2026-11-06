@@ -6,6 +6,12 @@ HTTP servers and an in-memory implementation of the storage trait.
 the mapping before returning a router-generated reservation ID. Transaction
 execution is still a dummy handler.
 
+`api` contains HTTP routing and handlers (`health`, `reservation`, `execution`).
+`services::reservation::ReservationService` owns reservation selection, retry
+policy and mapping storage. `services::execution::ExecutionService` is a
+placeholder for future execution logic. `server` wires dependencies, starts
+listeners and manages shutdown and backend health monitoring.
+
 ```sh
 cargo run -- init                       # YAML on stdout
 cargo run -- init --config-file config.yaml
@@ -46,6 +52,18 @@ The config key is `routing.execute_tx`; the HTTP path is
 `/v1/execute_transaction`. Both listeners bind before serving. SIGINT and SIGTERM
 gracefully stop both servers.
 
+Logging uses `tracing` with timestamps, levels, module targets and event fields.
+Logs go to stderr; `init` keeps stdout as YAML only. The default level is `info`;
+override it with `RUST_LOG`, for example:
+
+```sh
+RUST_LOG=gas_station_router_v2=debug cargo run -- start --config-file config.yaml
+```
+
+Startup, listener addresses, graceful shutdown and fatal command errors are
+logged. Fatal errors exit with code 1. ANSI colors are enabled only when stderr
+is a terminal.
+
 Reservations accept `{"gas_budget": 1000000, "reserve_duration_secs": 60}`.
 When `rpc.token` is nonempty, this endpoint requires `Authorization: Bearer <token>`.
 The upstream receives its own configured backend token, not the client's token.
@@ -62,15 +80,43 @@ backend eligible; this is an HTTP health check, not an execution canary. Set
 omitting `enabled` defaults to true. Selection is round robin and performs no
 network or storage I/O. Candidate `inflight` counts active backend requests.
 
-`max_retries` counts additional attempts after the first. Only configured
-`connect_error` failures trigger another selection, after `backoff`; failed
-backends are excluded for the rest of that request and marked unhealthy until
-a successful probe. The timeout is per HTTP attempt, including the response body.
-Timeouts, interrupted/malformed responses, HTTP/business errors and storage write
-failures do not retry. Redirects and the HTTP client's automatic retries are
-disabled. No eligible backend or a failed mapping write returns 503; exhausted
-connection errors return 502 and timeouts return 504. A storage failure returns
-no reservation to the client; upstream reservations then expire normally.
+The HTTP handler in `api::reservation` calls
+`ReservationService::reserve_with_retry()` for selection, retries and mapping
+storage; `reserve_once()` performs exactly one backend HTTP request.
+
+```yaml
+routing:
+  reserve_gas:
+    timeout: 3s
+    retries:
+      max_retries: 2
+      backoff: 200ms
+```
+
+`max_retries` counts additional attempts: 2 allows at most 3 backend requests.
+`ReserveError::is_retryable()` replaces the old `retry_on` config field:
+
+| Error | Retry | Classification |
+| --- | --- | --- |
+| `ConnectionFailed` | Yes | Connection establishment failed, including a connect timeout; request not delivered. |
+| `ReservationRejected` | Yes | Explicit negative `result: null` / nonempty `error` envelope with HTTP 2xx or 429, or a known safe Gas Station rejection below. |
+| `UnknownOutcome` | No | Response/body timeout, interrupted/malformed response, or an unrecognized 5xx; reservation may exist. |
+| `Permanent` | No | Invalid request, other HTTP 4xx, redirect or request construction failure. |
+
+The current Gas Station uses string errors for safe rejections even with 5xx:
+`Unable to reserve gas coins for the given budget.`,
+`Gas station is in maintenance mode. Please try again later.`, and
+`Gas usage exceeds daily cap`. Only exact matches in a negative envelope qualify;
+generic 5xx and Redis errors remain ambiguous.
+
+Retry selects another eligible backend, excludes the failed one for this request,
+and waits `backoff` before sending. Connection failures also mark the backend
+unhealthy until a successful probe. The timeout is per HTTP attempt, including
+the response body. Redirects and automatic HTTP client retries are disabled.
+Exhausting the retry budget or candidates returns the last failure. No initially
+eligible backend or a failed mapping write returns 503; connection errors return
+502 and timeouts return 504. Storage failures never trigger a new reservation;
+upstream reservations then expire normally.
 
 `storage::memory::MemoryStorage::new()` implements `storage::Storage`. Cloning a
 store shares its state. Entries expire by a monotonic clock and are cleaned on

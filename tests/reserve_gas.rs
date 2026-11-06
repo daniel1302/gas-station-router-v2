@@ -14,11 +14,11 @@ use axum::{
     http::{Request, StatusCode},
 };
 use gas_station_router_v2::{
+    api,
     backend::registry::BackendRegistry,
-    config::{BackendConfig, ReserveGasConfig, RetryConfig, RetryOn},
-    reserve::{ReserveService, http_client},
+    config::{BackendConfig, ReserveGasConfig, RetryConfig},
     routing::{BackendCandidate, BackendSelector, round_robin::RoundRobinSelector},
-    server::rpc_routes,
+    services::reservation::{ReservationService, ReserveError, http_client},
     storage::{
         CachedTransaction, ExecutionClaim, ExecutionRecord, ExecutionToken, Reservation,
         ReservationId, Storage, StorageError, StorageResult, TransactionWriteOutcome,
@@ -54,13 +54,12 @@ fn success(id: u64) -> Value {
     })
 }
 
-fn settings(retries: u32, retry_on: Vec<RetryOn>, timeout: Duration) -> ReserveGasConfig {
+fn settings(retries: u32, timeout: Duration) -> ReserveGasConfig {
     ReserveGasConfig {
         timeout,
         retries: RetryConfig {
             max_retries: retries,
             backoff: Duration::ZERO,
-            retry_on,
         },
     }
 }
@@ -76,7 +75,7 @@ fn app(
         registry.set_healthy(&backend.name, true);
     }
     let client = http_client(config.timeout).unwrap();
-    let service = ReserveService::new(
+    let service = ReservationService::new(
         registry.clone(),
         Arc::new(RoundRobinSelector::new()),
         storage,
@@ -85,7 +84,7 @@ fn app(
         Duration::from_secs(900),
     )
     .unwrap();
-    (rpc_routes(Arc::new(service), token.into()), registry)
+    (api::router(Arc::new(service), token.into()), registry)
 }
 
 async fn send(app: Router, body: Value, token: Option<&str>) -> (StatusCode, Value) {
@@ -133,7 +132,7 @@ async fn forwards_backend_token_and_rewrites_only_reservation_id_after_storing()
     let (router, registry) = app(
         vec![config],
         storage.clone(),
-        settings(1, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+        settings(1, Duration::from_secs(1)),
         "client-token",
     );
     let (status, mut body) = send(router, request(), Some("client-token")).await;
@@ -172,7 +171,7 @@ async fn rotates_three_backends_in_round_robin_order() {
             backend("c", c.uri()),
         ],
         storage.clone(),
-        settings(1, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+        settings(1, Duration::from_secs(1)),
         "",
     );
     for name in ["a", "b", "c", "a", "b", "c"] {
@@ -199,7 +198,7 @@ async fn skips_unhealthy_disabled_and_request_excluded_backends() {
     let (router, registry) = app(
         vec![backend("a", a.uri()), backend("b", b.uri()), disabled],
         Arc::new(MemoryStorage::new()),
-        settings(1, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+        settings(1, Duration::from_secs(1)),
         "",
     );
     registry.set_healthy("b", false);
@@ -235,7 +234,7 @@ async fn retries_connect_error_on_b_without_skipping_to_c() {
     )
     .await;
     let storage = Arc::new(MemoryStorage::new());
-    let mut retry = settings(1, vec![RetryOn::ConnectError], Duration::from_secs(1));
+    let mut retry = settings(1, Duration::from_secs(1));
     retry.retries.backoff = Duration::from_millis(30);
     let (router, registry) = app(
         vec![
@@ -267,27 +266,25 @@ async fn retries_connect_error_on_b_without_skipping_to_c() {
 }
 
 #[tokio::test]
-async fn retry_limit_and_empty_retry_policy_prevent_failover() {
+async fn zero_retries_prevents_failover() {
     let b = MockServer::start().await;
     mock_reservation(&b, ResponseTemplate::new(200).set_body_json(success(2)), 0).await;
-    for (max_retries, retry_on) in [(0, vec![RetryOn::ConnectError]), (5, vec![])] {
-        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = closed.local_addr().unwrap();
-        drop(closed);
-        let (router, _) = app(
-            vec![
-                backend("a", format!("http://{address}")),
-                backend("b", b.uri()),
-            ],
-            Arc::new(MemoryStorage::new()),
-            settings(max_retries, retry_on, Duration::from_secs(1)),
-            "",
-        );
-        assert_eq!(
-            send(router, request(), None).await.0,
-            StatusCode::BAD_GATEWAY
-        );
-    }
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = closed.local_addr().unwrap();
+    drop(closed);
+    let (router, _) = app(
+        vec![
+            backend("a", format!("http://{address}")),
+            backend("b", b.uri()),
+        ],
+        Arc::new(MemoryStorage::new()),
+        settings(0, Duration::from_secs(1)),
+        "",
+    );
+    assert_eq!(
+        send(router, request(), None).await.0,
+        StatusCode::BAD_GATEWAY
+    );
 }
 
 #[tokio::test]
@@ -306,7 +303,7 @@ async fn retry_budget_stops_before_a_third_backend() {
             backend("c", c.uri()),
         ],
         Arc::new(MemoryStorage::new()),
-        settings(1, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+        settings(1, Duration::from_secs(1)),
         "",
     );
     assert_eq!(
@@ -315,9 +312,149 @@ async fn retry_budget_stops_before_a_third_backend() {
     );
 }
 
+#[test]
+fn reserve_error_policy_retries_only_definite_failures() {
+    assert!(ReserveError::ConnectionFailed.is_retryable());
+    assert!(ReserveError::ReservationRejected.is_retryable());
+    assert!(!ReserveError::UnknownOutcome.is_retryable());
+    assert!(!ReserveError::Permanent.is_retryable());
+}
+
 #[tokio::test]
-async fn backend_http_and_business_errors_are_returned_without_retry_or_mapping() {
-    for status in [200, 400, 429, 500, 503] {
+async fn explicit_reservation_rejections_fail_over_and_store_only_the_success() {
+    for (status, error) in [
+        (200, "reservation rejected"),
+        (429, "rate limited"),
+        (500, "Unable to reserve gas coins for the given budget."),
+        (
+            503,
+            "Gas station is in maintenance mode. Please try again later.",
+        ),
+        (500, "Gas usage exceeds daily cap"),
+    ] {
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        mock_reservation(
+            &a,
+            ResponseTemplate::new(status).set_body_json(json!({"result": null, "error": error})),
+            1,
+        )
+        .await;
+        mock_reservation(&b, ResponseTemplate::new(200).set_body_json(success(20)), 1).await;
+        let storage = Arc::new(MemoryStorage::new());
+        let (router, registry) = app(
+            vec![backend("a", a.uri()), backend("b", b.uri())],
+            storage.clone(),
+            settings(2, Duration::from_secs(1)),
+            "",
+        );
+        let (status, body) = send(router, request(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let mapping = storage
+            .get_reservation(body["result"]["reservation_id"].as_u64().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.backend, "b");
+        assert_eq!(mapping.upstream_reservation_id, 20);
+        // A rejection only excludes the backend from this request.
+        assert_eq!(registry.candidates(&HashSet::new()).len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn two_retries_allow_connection_failure_then_rejection_then_success() {
+    let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unavailable = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let b = MockServer::start().await;
+    let c = MockServer::start().await;
+    mock_reservation(
+        &b,
+        ResponseTemplate::new(500).set_body_json(json!({
+            "result": null, "error": "Unable to reserve gas coins for the given budget."
+        })),
+        1,
+    )
+    .await;
+    mock_reservation(&c, ResponseTemplate::new(200).set_body_json(success(30)), 1).await;
+    let storage = Arc::new(MemoryStorage::new());
+    let (router, _) = app(
+        vec![
+            backend("a", unavailable),
+            backend("b", b.uri()),
+            backend("c", c.uri()),
+        ],
+        storage.clone(),
+        settings(2, Duration::from_secs(1)),
+        "",
+    );
+    let (status, body) = send(router, request(), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let mapping = storage
+        .get_reservation(body["result"]["reservation_id"].as_u64().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(mapping.backend, "c");
+    assert_eq!(mapping.upstream_reservation_id, 30);
+}
+
+#[tokio::test]
+async fn rejection_retry_budget_returns_last_rejection_without_a_fourth_attempt() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    let c = MockServer::start().await;
+    let d = MockServer::start().await;
+    let body = json!({"result": null, "error": "rate limited", "extra": "preserved"});
+    for server in [&a, &b, &c] {
+        mock_reservation(server, ResponseTemplate::new(429).set_body_json(&body), 1).await;
+    }
+    mock_reservation(&d, ResponseTemplate::new(200).set_body_json(success(40)), 0).await;
+    let storage = Arc::new(UnavailableStorage::default());
+    let (router, _) = app(
+        vec![
+            backend("a", a.uri()),
+            backend("b", b.uri()),
+            backend("c", c.uri()),
+            backend("d", d.uri()),
+        ],
+        storage.clone(),
+        settings(2, Duration::from_secs(1)),
+        "",
+    );
+    let (status, actual) = send(router, request(), None).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(actual, body);
+    assert_eq!(storage.writes.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn no_remaining_candidate_returns_last_rejection_and_exclusions_are_per_request() {
+    let a = MockServer::start().await;
+    let body = json!({"result": null, "error": "reservation rejected"});
+    mock_reservation(&a, ResponseTemplate::new(200).set_body_json(&body), 2).await;
+    let storage = Arc::new(UnavailableStorage::default());
+    let mut config = settings(100, Duration::from_secs(1));
+    // Exhausting candidates should return without waiting for a nonexistent retry.
+    config.retries.backoff = Duration::from_secs(10);
+    let (router, _) = app(vec![backend("a", a.uri())], storage.clone(), config, "");
+    for _ in 0..2 {
+        let (status, actual) = tokio::time::timeout(
+            Duration::from_secs(1),
+            send(router.clone(), request(), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(actual, body);
+    }
+    assert_eq!(storage.writes.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn permanent_and_unknown_backend_errors_do_not_retry_or_store() {
+    for status in [400, 401, 403, 404, 422, 500, 502, 503] {
         let a = MockServer::start().await;
         let b = MockServer::start().await;
         let body = json!({"result": null, "error": "reservation rejected"});
@@ -327,7 +464,7 @@ async fn backend_http_and_business_errors_are_returned_without_retry_or_mapping(
         let (router, _) = app(
             vec![backend("a", a.uri()), backend("b", b.uri())],
             storage.clone(),
-            settings(3, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+            settings(3, Duration::from_secs(1)),
             "",
         );
         let (actual_status, actual_body) = send(router, request(), None).await;
@@ -354,7 +491,7 @@ async fn timeout_does_not_retry_an_ambiguous_reservation() {
     let (router, _) = app(
         vec![backend("a", a.uri()), backend("b", b.uri())],
         storage.clone(),
-        settings(3, vec![RetryOn::ConnectError], Duration::from_millis(50)),
+        settings(3, Duration::from_millis(50)),
         "",
     );
     assert_eq!(
@@ -374,6 +511,9 @@ async fn malformed_success_response_does_not_retry_or_store() {
     invalid_sponsor["result"]["sponsor_address"] = json!("invalid");
     for body in [
         json!({}),
+        json!({"error": "rejected but result field is missing"}),
+        json!({"result": null, "error": ""}),
+        json!({"result": null, "error": "  "}),
         empty_coins,
         conflicting_envelope,
         invalid_sponsor,
@@ -386,7 +526,7 @@ async fn malformed_success_response_does_not_retry_or_store() {
         let (router, _) = app(
             vec![backend("a", a.uri()), backend("b", b.uri())],
             storage.clone(),
-            settings(1, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+            settings(1, Duration::from_secs(1)),
             "",
         );
         assert_eq!(
@@ -407,7 +547,7 @@ async fn failed_storage_write_never_retries_a_successful_upstream_reservation() 
     let (router, _) = app(
         vec![backend("a", a.uri()), backend("b", b.uri())],
         storage.clone(),
-        settings(3, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+        settings(3, Duration::from_secs(1)),
         "",
     );
     let (status, body) = send(router, request(), None).await;
@@ -436,7 +576,7 @@ async fn redirects_are_not_followed() {
     let (router, _) = app(
         vec![backend("a", a.uri()), backend("b", b.uri())],
         Arc::new(MemoryStorage::new()),
-        settings(3, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+        settings(3, Duration::from_secs(1)),
         "",
     );
     assert_eq!(
@@ -452,7 +592,7 @@ async fn authentication_and_request_validation_happen_before_forwarding() {
     let (router, _) = app(
         vec![backend("a", a.uri())],
         Arc::new(MemoryStorage::new()),
-        settings(1, vec![RetryOn::ConnectError], Duration::from_secs(1)),
+        settings(1, Duration::from_secs(1)),
         "client-token",
     );
     for token in [None, Some("wrong-token")] {
@@ -569,7 +709,7 @@ async fn concurrent_requests_rotate_backends_and_preserve_each_mapping() {
             backend("c", c.uri()),
         ],
         storage.clone(),
-        settings(1, vec![RetryOn::ConnectError], Duration::from_secs(2)),
+        settings(1, Duration::from_secs(2)),
         "",
     );
     let mut tasks = Vec::new();
@@ -607,7 +747,7 @@ async fn inflight_tracks_active_requests_and_is_released_on_cancellation() {
     let (router, registry) = app(
         vec![backend("a", a.uri())],
         Arc::new(MemoryStorage::new()),
-        settings(1, vec![RetryOn::ConnectError], Duration::from_secs(5)),
+        settings(1, Duration::from_secs(5)),
         "",
     );
     let task = tokio::spawn(async move { send(router, request(), None).await });

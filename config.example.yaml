@@ -22,10 +22,8 @@ routing:
   reserve_gas:
     timeout: 3s
     retries:
-      max_retries: 1
+      max_retries: 2
       backoff: 200ms
-      retry_on:
-        - connect_error
   execute_tx:
     timeout: 30s
 
