@@ -123,13 +123,6 @@ pub struct RetryConfig {
     pub max_retries: u32,
     #[serde(with = "humantime_serde")]
     pub backoff: Duration,
-    pub retry_on: Vec<RetryOn>,
-}
-
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RetryOn {
-    ConnectError,
 }
 
 #[derive(Deserialize)]
@@ -247,6 +240,7 @@ mod tests {
             .replace("${REDIS_URL}", "redis://localhost:6379")
             .replace("${GAS_STATION_B_TOKEN}", "literal-backend-token");
         let config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(config.routing.reserve_gas.retries.max_retries, 2);
         assert_eq!(
             config.routing.reserve_gas.retries.backoff,
             Duration::from_millis(200)
