@@ -15,6 +15,7 @@ pub const EXAMPLE_CONFIG: &str = include_str!("../config.example.yaml");
 pub struct Config {
     pub rpc: RpcConfig,
     pub metrics: HttpConfig,
+    pub iota: IotaConfig,
     pub storage: StorageConfig,
     pub routing: RoutingConfig,
     pub backends: Vec<BackendConfig>,
@@ -60,6 +61,15 @@ impl HttpConfig {
     pub fn address(&self) -> SocketAddr {
         SocketAddr::new(self.host, self.port)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IotaConfig {
+    #[serde(deserialize_with = "env_string")]
+    pub rpc_url: String,
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
 }
 
 #[derive(Deserialize)]
@@ -227,6 +237,7 @@ mod tests {
     fn invalid_duration_and_unknown_options_are_rejected() {
         let yaml = EXAMPLE_CONFIG
             .replace("${GS_AUTH}", "literal-rpc-token")
+            .replace("${IOTA_RPC_URL}", "http://localhost:9000")
             .replace("${REDIS_URL}", "redis://localhost:6379")
             .replace("${GAS_STATION_B_TOKEN}", "literal-backend-token");
         let config: Config = serde_yaml_ng::from_str(&yaml).unwrap();

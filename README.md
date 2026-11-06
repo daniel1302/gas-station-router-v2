@@ -11,6 +11,7 @@ cargo run -- init --config-file config.yaml
 # --output config.yaml is also accepted; existing files are never overwritten.
 
 export GS_AUTH='example-router-token'
+export IOTA_RPC_URL='http://localhost:9000'
 export REDIS_URL='redis://localhost:6379'
 export GAS_STATION_B_TOKEN='example-backend-token'
 cargo run -- start --config-file config.yaml
@@ -20,8 +21,8 @@ See [config.example.yaml](config.example.yaml) for the complete config. `start`
 requires `--config-file`. The `memory` storage kind can omit the `redis` section;
 the `redis` kind requires it.
 
-The RPC token, Redis URL, backend tokens and backend RPC URLs accept whole-value
-environment references: `${NAME}` or `$NAME`. Other values are used literally.
+The RPC token, IOTA RPC URL, Redis URL, backend tokens and backend RPC URLs accept
+whole-value environment references: `${NAME}` or `$NAME`. Other values are used literally.
 Missing variables fail config loading. Substitution happens after YAML parsing,
 so environment values containing YAML syntax are preserved as strings. `init`
 keeps the placeholders and does not require environment variables.
