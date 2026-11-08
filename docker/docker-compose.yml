@@ -33,7 +33,8 @@ x-gas-station: &gas-station
 services:
   redis:
     image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    ports: ["127.0.0.1:${ROUTER_REDIS_PORT:-6380}:6379"]
     volumes:
       - redis-data:/data
     healthcheck:
@@ -41,6 +42,19 @@ services:
       interval: 2s
       timeout: 2s
       retries: 20
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:stable-alpine
+    network_mode: host
+    environment:
+      ROUTER_PROXY_PORT: ${ROUTER_PROXY_PORT:-9257}
+      ROUTER_1_RPC_PORT: ${ROUTER_1_RPC_PORT:-9261}
+      ROUTER_2_RPC_PORT: ${ROUTER_2_RPC_PORT:-9262}
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      NGINX_ENVSUBST_FILTER: ^ROUTER_
+    volumes:
+      - ./nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
     restart: unless-stopped
 
   gas-station-1:

@@ -3,7 +3,7 @@
 A Rust router for IOTA Gas Stations. It distributes gas reservations across healthy
 backends and sends each transaction to the station that reserved its gas.
 
-For a local setup with Redis, three Gas Stations and e2e tests, see
+For two routers behind Nginx, Redis, Gas Stations and a full failure test, see
 [docker/README.md](docker/README.md).
 
 ## Quick start
@@ -26,8 +26,8 @@ export GAS_STATION_B_TOKEN='example-backend-token'
 cargo run -- start --config-file config.yaml
 ```
 
-Use `storage.kind: memory`. Redis storage for the router is not implemented yet.
-Memory storage loses reservations and execution state on restart.
+Use `storage.kind: memory` for process-local storage, or `redis` to share state
+between router instances. Memory storage loses its state on restart.
 
 Tokens and RPC/Redis URLs can reference environment variables as `${NAME}` or `$NAME`.
 Missing variables fail startup, including references in an unused Redis section.
@@ -36,6 +36,32 @@ Durations accept values such as `3s`, `200ms` and `15m`. Unknown fields are reje
 `init` creates a new file without overwriting an existing one. Run `cargo run -- init`
 to print the example config instead. Stop the router with `Ctrl+C` or `SIGTERM`.
 
+## Redis storage
+
+```yaml
+storage:
+  kind: redis
+  redis:
+    url: ${REDIS_URL}
+    key_prefix: gas-station-router
+```
+
+Use Redis 7.4 with persistence enabled and `maxmemory-policy noeviction`. The router
+checks the policy at startup. When Redis is full, writes fail instead of silently
+evicting execution records. Connections and commands have a 2-second timeout.
+
+Keys use `<key_prefix>:v2:`. Reservations use `routing.ttl.reservation`, execution
+records use `routing.execute_tx.inflight.record_ttl`, and effects use
+`routing.ttl.transaction_effects`. TTL is set when each key is created. Reads,
+lease recovery, completion and cache upgrades preserve the original expiry.
+Leases live inside execution records; there are no separate lease keys or indexes.
+One fixed ID counter stays persistent to prevent ID reuse after expiry or restart.
+
+Lua scripts make claims and execution updates atomic across router instances.
+Each operation has its own file in [`src/storage/redis/scripts`](src/storage/redis/scripts),
+with shared helpers for TTL, leases and cache updates.
+Keep the same prefix across replicas. This implementation uses standalone Redis.
+
 ## HTTP API
 
 The default RPC port is `9257`; metrics use `9184`.
@@ -43,6 +69,7 @@ The default RPC port is `9257`; metrics use `9184`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/health` | Router health: `{"status":"ok"}` |
+| GET | `/status` | Configured Gas Stations, health, cooldowns and reservation availability |
 | POST | `/v1/reserve_gas` | Reserve gas coins |
 | POST | `/v1/execute_tx` | Execute a transaction |
 | POST | `/v1/execute_transaction` | Alias of `/v1/execute_tx` |
@@ -50,6 +77,63 @@ The default RPC port is `9257`; metrics use `9184`.
 
 When `rpc.token` is set, both POST endpoints require `Authorization: Bearer <token>`.
 The router uses each backend's own token when forwarding requests.
+
+### Router status
+
+```sh
+curl -sS http://localhost:9257/status
+```
+
+`GET /status` is unauthenticated, including when `rpc.token` is set. The response
+contains backend names and operational diagnostics from this router's local registry:
+
+```json
+{
+  "summary": {
+    "total": 1,
+    "enabled": 1,
+    "disabled": 0,
+    "healthy": 0,
+    "degraded": 1,
+    "unhealthy": 0,
+    "eligible_for_reservations": 0,
+    "inflight_reservations": 0
+  },
+  "gas_stations": [
+    {
+      "name": "station_a",
+      "enabled": true,
+      "health": "degraded",
+      "eligible_for_reservations": false,
+      "inflight_reservations": 0,
+      "active_success_count": 2,
+      "active_failure_count": 0,
+      "reservation_failure_count": 0,
+      "cooldown": {
+        "active": true,
+        "duration_ms": 15000,
+        "remaining_ms": 14000,
+        "next_duration_ms": 30000
+      }
+    }
+  ]
+}
+```
+
+Health counts include all configured stations, including disabled ones. Only
+enabled, healthy stations outside cooldown are eligible for new reservations.
+`inflight_reservations` counts upstream reservation HTTP calls currently in progress.
+The active counters track consecutive probes; the reservation failure counter
+resets after a successful reservation.
+
+`cooldown` is `null` until a capacity rejection starts one. After expiry, its
+remaining time is zero and `active` is false; its duration stays available for
+the next backoff until a successful reservation clears it. `Unhealthy` stations
+remain ineligible after cooldown expires.
+
+Each router reports its own health observations, even when Redis is shared.
+Reading status uses local memory. The endpoint returns HTTP 200 even when no
+station is eligible; inspect `summary.eligible_for_reservations` for availability.
 
 ## Reservations
 
@@ -63,6 +147,78 @@ The router selects an eligible backend using round robin and stores its reservat
 ID. The response keeps the sponsor and gas coins, but replaces `reservation_id`
 with the router's ID. Use that ID for execution. Mappings expire after
 `routing.ttl.reservation`.
+
+### Reservation flow
+
+```text
+                      POST /v1/reserve_gas
+                                |
+                                v
+                 HTTP authorization + JSON validation
+                                |
+                   +------------+------------+
+                   |                         |
+                 Valid                 Invalid / unauthorized
+                   |                         |
+                   v                         v
+     ReservationService.reserve_with_retry()  400 / 401
+                   |
+                   v
+     Validate gas_budget > 0 and reserve_duration_secs > 0
+                   |
+            Invalid? -- yes --> 400 Bad Request
+                   |
+                   no
+                   |
+                   v
+            Backend selection [S]
+       BackendRegistry.candidates(excluded)
+       (enabled + Healthy + not tried in this request)
+                   |
+                   v
+        RoundRobinSelector.select(candidates)
+                   |
+      No candidate? -- yes --> Return last failure, or 503 if none
+                   |
+                   no
+                   |
+                   v
+       Wait configured backoff if this is a retry
+                   |
+                   v
+      POST selected Gas Station /v1/reserve_gas
+      (backend token, configured request timeout)
+                   |
+         +---------+-------------------------+
+         |                                   |
+         v                                   v
+ Valid upstream reservation                 Failure
+ (sponsor, nonempty coins, upstream ID)        |
+         |                                   v
+         v                      Record passive health outcome
+ Record successful reservation               |
+ (reset passive failure count)               v
+         |                             Retry decision [R]
+         v
+ Storage.create_reservation(backend, upstream_reservation_id, TTL)
+         |
+     Storage error? -- yes --> 503 Service Unavailable; no retry
+         |
+         no
+         |
+         v
+ Replace result.reservation_id with the router ID
+ Keep the upstream sponsor, gas coins and response status
+         |
+         v
+       Response
+```
+
+The mapping points execution to the original backend and upstream reservation ID.
+Its TTL comes from `routing.ttl.reservation`; `reserve_duration_secs` is forwarded
+to the Gas Station unchanged.
+
+### Reservation retry flow [R]
 
 Retries use `routing.reserve_gas.retries`. With `max_retries: 2`, the router makes
 at most three attempts, waiting `backoff` before each retry and choosing a different
@@ -79,6 +235,39 @@ Known safe rejections include insufficient gas coins, maintenance and the daily
 cap, even when returned as 5xx. The router recognizes exact Gas Station errors;
 an arbitrary 5xx never makes a retry safe. A mapping storage failure also stops
 without creating another reservation.
+
+```text
+                 Retry decision [R]
+          (passive health outcome recorded)
+                         |
+                         v
+              Inspect ReserveError
+                         |
+          +--------------+---------------------+
+          |                                    |
+          v                                    v
+  ConnectionFailed /                  UnknownOutcome / Permanent
+  ReservationRejected                          |
+          |                                    v
+          v                           Return failure; no retry
+  Retry budget remaining?
+          |
+     +----+----+
+     |         |
+     no        yes
+     |         |
+     v         v
+  Return    Exclude this backend for the current request
+  failure      |
+               v
+       Return to backend selection [S]
+       Rebuild the eligible candidate list
+               |
+               v
+       Select a different eligible backend,
+       then wait backoff before sending again
+       (no candidate: return the last failure)
+```
 
 ## Backend health
 
@@ -358,6 +547,9 @@ not run checks or change state. Labels use fixed categories and configured backe
 names.
 
 ## Development
+
+Redis integration tests start and remove isolated Docker containers using
+`redis:7.4-alpine`. Docker must be available; no existing database is modified.
 
 ```sh
 cargo fmt --all -- --check

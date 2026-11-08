@@ -17,6 +17,10 @@ use serde_json::{Value, json};
 const DEFAULT_RPC: &str = "https://api.testnet.iota.cafe";
 const DEFAULT_ROUTER: &str = "http://127.0.0.1:9257";
 
+mod cluster;
+mod full;
+mod setup;
+
 #[derive(Parser)]
 #[command(about = "Incremental Gas Station Router e2e tests (Testnet)")]
 struct Cli {
@@ -36,6 +40,11 @@ enum Action {
     Reserve(Options),
     /// Sign and submit random transactions, then verify their finalized effects.
     Transactions(Options),
+    /// Run two router binaries behind the local Nginx proxy.
+    Routers,
+    /// Run the Testnet, Redis and Gas Station failure scenario, including TTL drain.
+    #[command(alias = "full_e2e", alias = "ful_e2e")]
+    FullE2e,
 }
 
 #[derive(clap::Args)]
@@ -62,6 +71,8 @@ async fn main() -> Result<()> {
         Action::Init | Action::Sponsors => print_sponsors(),
         Action::Reserve(options) => run(options, false).await,
         Action::Transactions(options) => run(options, true).await,
+        Action::Routers => cluster::run().await,
+        Action::FullE2e => full::run(&cli.env_file).await,
     }
 }
 
@@ -149,6 +160,7 @@ async fn run(options: Options, execute: bool) -> Result<()> {
     let router = router.trim_end_matches('/');
     let rpc = std::env::var("IOTA_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC.into());
     let token = std::env::var("GS_AUTH").unwrap_or_default();
+    setup::print_incremental(router, &rpc, &token);
     let mut auth = reqwest::header::HeaderMap::new();
     if !token.is_empty() {
         let mut header = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))?;

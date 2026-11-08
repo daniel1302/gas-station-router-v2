@@ -7,6 +7,7 @@ use iota_sdk_types::TransactionDigest;
 use serde::{Deserialize, Serialize};
 
 pub mod memory;
+pub mod redis;
 
 pub type ReservationId = u64;
 pub type StorageResult<T> = Result<T, StorageError>;

@@ -1,4 +1,4 @@
-# Run the router on the host: cargo run -- start --config-file docker/router.config.yaml
+# Base config for the two host processes started by ./start-router.sh.
 rpc:
   host: 127.0.0.1
   port: 9257
@@ -11,7 +11,10 @@ iota:
   rpc_url: ${IOTA_RPC_URL}
   timeout: 10s
 storage:
-  kind: memory
+  kind: redis
+  redis:
+    url: ${ROUTER_REDIS_URL}
+    key_prefix: gas-station-router-e2e
 routing:
   algorithm: round_robin
   reserve_gas:
