@@ -34,7 +34,7 @@ enum Action {
     Sponsors,
     /// Test real gas reservations and round-robin coverage (works today).
     Reserve(Options),
-    /// Sign and submit random transactions (requires router execution support).
+    /// Sign and submit random transactions, then verify their finalized effects.
     Transactions(Options),
 }
 
@@ -170,8 +170,7 @@ async fn run(options: Options, execute: bool) -> Result<()> {
         .error_for_status()
         .context("Router health check failed")?;
     if execute {
-        // An invalid empty body cannot execute a transaction. Detect today's stub
-        // before locking coins in a reservation; real implementations reject it.
+        // Check that execution rejects an invalid body before reserving any coins.
         let response = router_client
             .post(format!("{router}/v1/execute_transaction"))
             .json(&json!({}))

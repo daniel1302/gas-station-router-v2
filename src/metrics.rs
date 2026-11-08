@@ -137,6 +137,7 @@ impl Metrics {
             "get_transaction",
             "try_claim_execution",
             "get_execution",
+            "try_claim_recovery",
             "mark_execution_dispatching",
             "complete_execution",
             "cancel_execution",

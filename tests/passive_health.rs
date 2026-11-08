@@ -34,6 +34,8 @@ use wiremock::{
 
 const NO_COINS: &str = "Unable to reserve gas coins for the given budget.";
 
+mod common;
+
 fn backend(name: &str, rpc: String) -> BackendConfig {
     BackendConfig {
         name: name.into(),
@@ -77,7 +79,11 @@ fn setup(
     )
     .unwrap();
     (
-        api::router(Arc::new(service), String::new()),
+        api::router(
+            Arc::new(service),
+            common::execution(registry.clone(), storage.clone()),
+            String::new(),
+        ),
         registry,
         storage,
     )
@@ -756,7 +762,11 @@ async fn client_authorization_failures_do_not_alert_on_the_backend() {
         Duration::from_secs(900),
     )
     .unwrap();
-    let router = api::router(Arc::new(service), "router-token".into());
+    let router = api::router(
+        Arc::new(service),
+        common::execution(registry.clone(), Arc::new(MemoryStorage::new())),
+        "router-token".into(),
+    );
     assert_eq!(reserve(router, 1).await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(registry.health("client_auth"), Some(BackendHealth::Healthy));
     let metrics = metrics::render().unwrap();

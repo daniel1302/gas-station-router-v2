@@ -8,6 +8,7 @@ metrics:
   port: 9184
 
 iota:
+  # Gas Stations' fullnode, used for execution recovery and local confirmation.
   rpc_url: ${IOTA_RPC_URL}
   timeout: 5s
 

@@ -229,6 +229,12 @@ impl Backend {
         self.authorize(client.post(url))
     }
 
+    pub(crate) fn execute_request(&self, client: &Client) -> RequestBuilder {
+        let mut url = self.url.clone();
+        url.set_path(&format!("{}v1/execute_tx", self.url.path()));
+        self.authorize(client.post(url))
+    }
+
     pub fn start_request(self: &Arc<Self>) -> InflightRequest {
         self.inflight.fetch_add(1, Ordering::Relaxed);
         InflightRequest(self.clone())

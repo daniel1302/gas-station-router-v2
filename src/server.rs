@@ -9,6 +9,7 @@ use crate::{
     config::{Config, RoutingAlgorithm, StorageKind},
     metrics,
     routing::round_robin::RoundRobinSelector,
+    services::execution::ExecutionService,
     services::reservation::{self, ReservationService},
     storage::{Storage, memory::MemoryStorage},
 };
@@ -31,6 +32,16 @@ pub async fn start(config: Config) -> Result<()> {
     let selector = match config.routing.algorithm {
         RoutingAlgorithm::RoundRobin => Arc::new(RoundRobinSelector::new()),
     };
+    let execution = Arc::new(ExecutionService::new(
+        registry.clone(),
+        storage.clone(),
+        config.routing.execute_tx,
+        config.iota,
+        crate::config::TtlConfig {
+            reservation: config.routing.ttl.reservation,
+            transaction_effects: config.routing.ttl.transaction_effects,
+        },
+    )?);
     let reservation = Arc::new(ReservationService::new(
         registry.clone(),
         selector,
@@ -51,7 +62,7 @@ pub async fn start(config: Config) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(());
     let rpc_server = async {
-        axum::serve(rpc, api::router(reservation, config.rpc.token))
+        axum::serve(rpc, api::router(reservation, execution, config.rpc.token))
             .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
             .await
             .context("RPC server failed")

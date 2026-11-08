@@ -1,4 +1,5 @@
 // One test keeps assertions on process-wide counters independent of test scheduling.
+mod common;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use axum::{
@@ -388,7 +389,11 @@ async fn reservation_metrics() {
         Duration::from_secs(900),
     )
     .unwrap();
-    let router = api::router(Arc::new(service), "client-token".into());
+    let router = api::router(
+        Arc::new(service),
+        common::execution(registry.clone(), Arc::new(MemoryStorage::new())),
+        "client-token".into(),
+    );
     let payload = json!({"gas_budget":1000000,"reserve_duration_secs":60});
     assert_eq!(
         send(router.clone(), payload.clone(), false).await,

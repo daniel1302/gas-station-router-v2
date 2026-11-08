@@ -4,16 +4,16 @@ Minimal Rust service with a YAML config, a Clap CLI, separate RPC and metrics
 HTTP servers and an in-memory implementation of the storage trait.
 `POST /v1/reserve_gas` routes reservations to enabled, healthy backends and stores
 the mapping before returning a router-generated reservation ID. Transaction
-execution is still a dummy handler.
+execution always uses the backend recorded by the reservation.
 
 Local Redis + three Gas Stations and incremental Rust e2e tests:
 [docker/README.md](docker/README.md). The `reserve` test works with the current
-router; `transactions` explicitly fails until execution is implemented.
+router; `transactions` submits signed transactions and verifies their effects.
 
 `api` contains HTTP routing and handlers (`health`, `reservation`, `execution`).
 `services::reservation::ReservationService` owns reservation selection, retry
-policy and mapping storage. `services::execution::ExecutionService` is a
-placeholder for future execution logic. `server` wires dependencies, starts
+policy and mapping storage. `services::execution::ExecutionService` owns execution,
+deduplication, effects caching and RPC recovery. `server` wires dependencies, starts
 listeners and manages shutdown and backend health monitoring.
 
 ```sh
@@ -49,11 +49,11 @@ router's port when running on the same host.
 | --- | --- | --- | --- |
 | RPC (`0.0.0.0:9257`) | GET | `/health` | `200`, `{"status":"ok"}` |
 | RPC | POST | `/v1/reserve_gas` | Gas Station response with a router reservation ID |
-| RPC | POST | `/v1/execute_transaction` | `501`, `{"error":"not implemented"}` |
+| RPC | POST | `/v1/execute_tx` | Transaction effects and local execution confirmation |
+| RPC | POST | `/v1/execute_transaction` | Alias of `/v1/execute_tx` |
 | Metrics (`0.0.0.0:9184`) | GET | `/metrics` | Prometheus text, `gas_station_router_up 1` |
 
-The config key is `routing.execute_tx`; the HTTP path is
-`/v1/execute_transaction`. Both listeners bind before serving. SIGINT and SIGTERM
+The execution config key is `routing.execute_tx`. Both listeners bind before serving. SIGINT and SIGTERM
 gracefully stop both servers.
 
 Logging uses `tracing` with timestamps, levels, module targets and event fields.
@@ -182,6 +182,89 @@ Exhausting the retry budget or candidates returns the last failure. No initially
 eligible backend or a failed mapping write returns 503; connection errors return
 502 and timeouts return 504. Storage failures never trigger a new reservation;
 upstream reservations then expire normally.
+
+Execution accepts the router reservation ID, base64 BCS transaction bytes, the
+base64 user signature, and an optional request type:
+
+```json
+{
+  "reservation_id": 123,
+  "tx_bytes": "<base64 BCS Transaction>",
+  "user_sig": "<base64 UserSignature>",
+  "request_type": "waitForLocalExecution"
+}
+```
+
+`request_type` defaults to `waitForEffectsCert`; `requestType` is also accepted.
+Execution requires the same router Bearer token as reservations. Invalid JSON,
+transaction BCS or signature encoding returns `400` before storage is modified.
+The digest is calculated from the decoded transaction using the pinned IOTA SDK.
+
+`ExecutionService` exposes only `new()` and `execute()`. Its `executor`, `inflight`
+and `recovery` modules are private. The execution flow is:
+
+```text
+POST /v1/execute_tx -> ExecutionService -> calculate digest -> get_execution
+  Claimed / missing -> try_claim_execution
+    Acquired -> get_reservation -> persist Dispatching -> Gas Station execute_tx
+             -> validate effects -> complete_execution -> response/cache
+    InFlight -> wait and read the result
+  Dispatching -> acquire recovery lease -> IOTA RPC getTransactionBlock
+    Found -> save effects -> Completed
+    Not found / RPC error -> retry lookup -> still unknown at the timeout
+  Completed -> read cache (recover through RPC if the effects cache has expired)
+```
+
+Only the original reservation backend receives the POST, using its own token and
+upstream reservation ID. Health filtering applies to new reservations, not execution
+of existing ones. Execution is never failed over to another Gas Station. A different
+digest for an existing execution returns `409`. Missing reservations return `404`;
+missing backend configuration or unavailable storage returns `503`.
+
+`Dispatching` is persisted before sending. A failed or uncertain storage transition
+prevents the POST. After dispatch, timeouts, redirects, error responses and malformed
+effects lead only to read-only RPC recovery. Neither lease expiry nor a lookup that
+returns not found authorizes another POST. Recovery uses an atomic storage lease,
+fences the previous owner, and preserves the execution record's phase and TTL.
+Completion releases the lease. Backend metadata is retained in the execution record
+so recovery survives reservation mapping expiry or removal of the backend config.
+
+RPC recovery polls `iota_getTransactionBlock` with `showEffects: true`. The digest,
+effects identity, final execution status and required effects fields are checked.
+Both successful and failed finalized transactions are cached. Empty optional lists
+and object-reference version representations are normalized between Gas Station and
+JSON-RPC responses. Pending, mismatched and invalid results are never cached.
+
+| Cache | Request type | Behavior |
+| --- | --- | --- |
+| Effects + local confirmation `false` | `waitForEffectsCert` | Return cache |
+| Effects + local confirmation `true` | `waitForEffectsCert` | Return cache |
+| Effects + local confirmation `true` | `waitForLocalExecution` | Return cache |
+| Effects + local confirmation `false` | `waitForLocalExecution` | Verify local execution through RPC, upgrade cache, return effects |
+
+Local execution is independently confirmed through RPC: an explicit
+`confirmedLocalExecution: true`, or `iota_isTransactionIndexedOnNode: true` after
+retrieving matching effects. A Gas Station success or the mere presence of effects
+in a remote transaction store is insufficient. `iota.rpc_url` must point to the
+fullnode used by the Gas Stations; local confirmation refers to that configured
+node. RPC requests never carry router/backend authorization headers. See the
+[IOTA RPC reference](https://docs.iota.org/iota-api-ref#iota_gettransactionblock).
+
+The response contains `effects`, `error`, and `confirmedLocalExecution`. Local
+confirmation can only be upgraded from false to true and never refreshes cache TTL.
+If local confirmation is unavailable, effects remain cached and the request returns
+`504` at its deadline. `waitForEffectsCert` can still read those cached effects.
+Concurrent execution requests wait for the stored result. Dropping the client
+connection does not cancel the owned execution task.
+
+`routing.execute_tx.timeout` bounds the entire operation, including waiting and
+recovery. RPC calls additionally use `iota.timeout`; polling waits 100 ms for another
+owner and 200 ms between RPC lookups. The execution lease must exceed the overall
+timeout. Record TTL must exceed the lease and be at least the reservation TTL.
+Effects TTL must be positive. Existing configs already satisfy these constraints.
+On `504`, retry the same reservation ID and transaction bytes. Recovery is driven
+by requests and only runs while a request is active. Retention is bounded by the
+configured TTLs; in-memory storage loses execution state on restart.
 
 `storage::memory::MemoryStorage::new()` implements `storage::Storage`. Cloning a
 store shares its state. Entries expire by a monotonic clock and are cleaned on
