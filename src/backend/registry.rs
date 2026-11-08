@@ -91,7 +91,7 @@ impl BackendRegistry {
                 value.set_sensitive(true);
                 Some(value)
             };
-            metrics::init_backend_authorization_errors(&config.name);
+            metrics::init_backend_metrics(&config.name);
             backends.push(Arc::new(Backend {
                 name: config.name.clone(),
                 url,
@@ -228,6 +228,17 @@ impl Backend {
         let success = outcome == HealthCheckOutcome::HttpStatus(200);
         state.record(success, healthy_threshold, unhealthy_threshold);
         let (reason, http_status) = outcome.log_fields();
+        if !success {
+            metrics::inc_backend_health_check_failure(&self.name, reason);
+            tracing::warn!(
+                backend = %self.name,
+                reason,
+                http_status,
+                active_failure_count = state.active_failure_count(),
+                threshold = unhealthy_threshold,
+                "Backend health check failed"
+            );
+        }
         let threshold = if success {
             healthy_threshold
         } else {

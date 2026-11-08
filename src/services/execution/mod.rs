@@ -10,10 +10,12 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::timeout;
+use tracing::Instrument;
 
 use crate::{
     backend::registry::BackendRegistry,
     config::{ExecuteTxConfig, IotaConfig, TtlConfig},
+    metrics,
     storage::{CachedTransaction, ExecutionToken, Storage, StorageError},
 };
 
@@ -43,13 +45,15 @@ pub struct ExecuteTxRequest {
 pub struct ExecutionReply {
     pub status: StatusCode,
     pub body: Value,
+    error_reason: Option<&'static str>,
 }
 
 impl ExecutionReply {
-    pub(crate) fn error(status: StatusCode, message: &str) -> Self {
+    pub(crate) fn error(status: StatusCode, reason: &'static str, message: &str) -> Self {
         Self {
             status,
             body: json!({"effects": null, "error": message}),
+            error_reason: Some(reason),
         }
     }
 
@@ -58,7 +62,31 @@ impl ExecutionReply {
             status: StatusCode::OK,
             body: json!({"effects": transaction.effects, "error": null,
                 "confirmedLocalExecution": transaction.local_execution_confirmed}),
+            error_reason: (transaction.effects["status"]["status"] == "failure")
+                .then_some("transaction_failed"),
         }
+    }
+
+    /// Count the final success or error once, including finalized on-chain failures
+    /// returned with HTTP 200. Intermediate failures are logged at their source.
+    pub(crate) fn observed(
+        self,
+        reservation_id: Option<u64>,
+        digest: Option<&TransactionDigest>,
+    ) -> Self {
+        if let Some(reason) = self.error_reason {
+            metrics::inc_execute_tx_error(reason);
+            tracing::warn!(
+                reason,
+                http_status = self.status.as_u16(),
+                reservation_id,
+                digest = digest.map(ToString::to_string),
+                "Execution request failed"
+            );
+        } else {
+            metrics::inc_execute_tx_success();
+        }
+        self
     }
 }
 
@@ -67,10 +95,12 @@ impl From<StorageError> for ExecutionReply {
         match error {
             StorageError::Conflict => Self::error(
                 StatusCode::CONFLICT,
+                "storage_conflict",
                 "execution ownership or cached effects conflict; retry the same reservation and transaction",
             ),
             _ => Self::error(
                 StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
                 "execution storage unavailable",
             ),
         }
@@ -155,26 +185,38 @@ impl ExecutionService {
     /// does not cancel the owned task. The overall timeout bounds waiting and RPC
     /// recovery; an unknown result never authorizes a second upstream submission.
     pub async fn execute(self: &Arc<Self>, request: ExecuteTxRequest) -> ExecutionReply {
+        let reservation_id = request.reservation_id;
         let Ok(transaction) = Transaction::from_base64(&request.tx_bytes) else {
-            return ExecutionReply::error(StatusCode::BAD_REQUEST, "invalid transaction BCS bytes");
+            return ExecutionReply::error(
+                StatusCode::BAD_REQUEST,
+                "invalid_transaction",
+                "invalid transaction BCS bytes",
+            )
+            .observed(Some(reservation_id), None);
         };
         if UserSignature::from_base64(&request.user_sig).is_err() {
             return ExecutionReply::error(
                 StatusCode::BAD_REQUEST,
+                "invalid_signature",
                 "invalid user signature encoding",
-            );
+            )
+            .observed(Some(reservation_id), None);
         }
         let digest = transaction.digest();
         let service = self.clone();
+        let span = tracing::info_span!("execution", reservation_id, digest = %digest);
         match tokio::spawn(async move {
-            match timeout(service.config.timeout, service.drive(&request, &digest, ExecutionToken::new_v4())).await {
+            let reply = match timeout(service.config.timeout, service.drive(&request, &digest, ExecutionToken::new_v4())).await {
                 Ok(Ok(reply) | Err(reply)) => reply,
-                Err(_) => ExecutionReply::error(StatusCode::GATEWAY_TIMEOUT,
+                Err(_) => ExecutionReply::error(StatusCode::GATEWAY_TIMEOUT, "timeout",
                     "execution result still unknown or local execution unconfirmed; retry the same reservation and transaction"),
-            }
-        }).await {
+            };
+            // Observe inside the owned task so client cancellation cannot hide errors.
+            reply.observed(Some(reservation_id), Some(&digest))
+        }.instrument(span)).await {
             Ok(reply) => reply,
-            Err(_) => ExecutionReply::error(StatusCode::INTERNAL_SERVER_ERROR, "execution task failed; retry the same reservation and transaction"),
+            Err(_) => ExecutionReply::error(StatusCode::INTERNAL_SERVER_ERROR, "task_failed", "execution task failed; retry the same reservation and transaction")
+                .observed(Some(reservation_id), Some(&digest)),
         }
     }
 }

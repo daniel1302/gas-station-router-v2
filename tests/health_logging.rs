@@ -13,6 +13,7 @@ use gas_station_router_v2::{
     config::{
         BackendConfig, HealthChecksConfig, PassiveHealthCheckConfig, ReserveGasConfig, RetryConfig,
     },
+    metrics,
     routing::round_robin::RoundRobinSelector,
     services::reservation::{ReservationService, ReserveGasRequest, http_client},
     storage::memory::MemoryStorage,
@@ -81,7 +82,7 @@ fn field(line: &str, key: &str, value: &str) -> bool {
 }
 
 #[tokio::test]
-async fn logs_explain_transitions_without_logging_unchanged_probes_or_secrets() {
+async fn observes_transitions_and_each_failure_without_duplicates_or_secrets() {
     let output = Arc::new(Mutex::new(Vec::new()));
     let writer = LogWriter(output.clone());
     let subscriber = tracing_subscriber::fmt()
@@ -260,6 +261,42 @@ async fn logs_explain_transitions_without_logging_unchanged_probes_or_secrets() 
     }
 
     let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+    let failures: Vec<_> = logs
+        .lines()
+        .filter(|line| {
+            line.contains("Backend health check failed") && field(line, "backend", "active_http")
+        })
+        .collect();
+    assert_eq!(
+        failures.len(),
+        3,
+        "failures before the unhealthy threshold must also be visible"
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|line| line.contains("WARN") && field(line, "reason", "http_error"))
+    );
+    let rendered = metrics::render().unwrap();
+    for series in [
+        "backend_health_check_failures_total{backend=\"active_http\",reason=\"http_error\"} 3",
+        "backend_health_check_failures_total{backend=\"active_refused\",reason=\"connection_refused\"} 3",
+        "backend_health_check_failures_total{backend=\"passive_http\",reason=\"http_error\"} 0",
+        "backend_health_transitions_total{backend=\"active_http\",health=\"unhealthy\",previous_health=\"healthy\"} 1",
+        "backend_health_transitions_total{backend=\"active_http\",health=\"healthy\",previous_health=\"unhealthy\"} 1",
+        "backend_health_transitions_total{backend=\"passive_http\",health=\"unhealthy\",previous_health=\"healthy\"} 1",
+        "backend_health_transitions_total{backend=\"capacity\",health=\"degraded\",previous_health=\"healthy\"} 3",
+        "backend_health_transitions_total{backend=\"capacity\",health=\"healthy\",previous_health=\"degraded\"} 3",
+        "backend_health_transitions_total{backend=\"manual\",health=\"unhealthy\",previous_health=\"healthy\"} 1",
+        "backend_health_transitions_total{backend=\"manual\",health=\"healthy\",previous_health=\"unhealthy\"} 1",
+    ] {
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == format!("gas_station_router_{series}")),
+            "missing series: {series}"
+        );
+    }
     let transitions: Vec<_> = logs
         .lines()
         .filter(|line| line.contains("Backend health changed"))

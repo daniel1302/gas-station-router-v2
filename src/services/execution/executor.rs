@@ -16,6 +16,7 @@ impl ExecutionService {
                 return Err(match result {
                     Ok(None) => ExecutionReply::error(
                         StatusCode::NOT_FOUND,
+                        "reservation_not_found",
                         "reservation not found or expired",
                     ),
                     Err(error) => error.into(),
@@ -29,6 +30,7 @@ impl ExecutionService {
                 .await?;
             return Err(ExecutionReply::error(
                 StatusCode::SERVICE_UNAVAILABLE,
+                "backend_not_configured",
                 "original reservation backend is not configured",
             ));
         };
@@ -51,6 +53,7 @@ impl ExecutionService {
             .map_err(|_| {
                 ExecutionReply::error(
                     StatusCode::BAD_GATEWAY,
+                    "invalid_backend_request",
                     "cannot build backend execution request",
                 )
             })?;
@@ -71,15 +74,69 @@ impl ExecutionService {
                 .serve_cached(digest, cached, request.request_type.unwrap_or_default())
                 .await;
         }
-        let response = self.backend_client.execute(http_request).await;
-        if let Ok(response) = response
-            && response.status().is_success()
-            && let Ok(body) = response.json::<Value>().await
-            && body.get("error").is_some_and(Value::is_null)
-            && let Some(effects) = body
-                .get("effects")
-                .and_then(|value| validated_effects(value, digest))
-        {
+        let warn = |reason: &'static str, http_status: Option<u16>| {
+            tracing::warn!(
+                backend = %backend.name,
+                reservation_id = request.reservation_id,
+                digest = %digest,
+                reason,
+                http_status,
+                next_action = "rpc_recovery",
+                "Backend execution result is uncertain"
+            );
+        };
+        let effects = match self.backend_client.execute(http_request).await {
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    warn("http_error", Some(status.as_u16()));
+                    None
+                } else {
+                    match response.json::<Value>().await {
+                        Ok(body) => {
+                            let effects = body
+                                .get("error")
+                                .filter(|error| error.is_null())
+                                .and_then(|_| body.get("effects"))
+                                .and_then(|value| validated_effects(value, digest));
+                            if effects.is_none() {
+                                let reason =
+                                    if body.get("error").is_some_and(|error| !error.is_null()) {
+                                        "backend_rejection"
+                                    } else {
+                                        "invalid_response"
+                                    };
+                                warn(reason, Some(status.as_u16()));
+                            }
+                            effects
+                        }
+                        Err(error) => {
+                            warn(
+                                if error.is_decode() {
+                                    "invalid_response"
+                                } else {
+                                    crate::backend::health::HealthCheckOutcome::from_error(&error)
+                                        .log_fields()
+                                        .0
+                                },
+                                Some(status.as_u16()),
+                            );
+                            None
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                warn(
+                    crate::backend::health::HealthCheckOutcome::from_error(&error)
+                        .log_fields()
+                        .0,
+                    None,
+                );
+                None
+            }
+        };
+        if let Some(effects) = effects {
             // The Gas Station response does not prove local execution, even when
             // waitForLocalExecution was requested. Confirm independently via RPC.
             let cached = CachedTransaction {

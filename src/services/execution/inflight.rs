@@ -15,6 +15,7 @@ impl ExecutionService {
                 if record.digest != *digest {
                     return Err(ExecutionReply::error(
                         StatusCode::CONFLICT,
+                        "digest_conflict",
                         "reservation already belongs to another transaction",
                     ));
                 }
@@ -49,6 +50,7 @@ impl ExecutionService {
                                         .ok_or_else(|| {
                                             ExecutionReply::error(
                                                 StatusCode::SERVICE_UNAVAILABLE,
+                                                "backend_metadata_missing",
                                                 "recovery backend metadata unavailable",
                                             )
                                         })?

@@ -292,8 +292,16 @@ async fn exports_static_events_and_scrapes_without_accessing_storage() {
         "storage_health_checks",
         "backend_selector_calls",
         "backend_authorization_errors",
+        "backend_health_transitions",
+        "backend_health_check_failures",
+        "reserve_gas_attempt_failures",
+        "reserve_gas_retries",
+        "execute_tx_errors",
+        "execute_tx_recovery_retries",
         "reserve_gas_requests",
         "reserve_gas_errors",
+        "reserve_gas_successes",
+        "execute_tx_successes",
     ] {
         assert!(text.contains(&format!(
             "# TYPE gas_station_router_{family}_total counter\n"
@@ -405,6 +413,8 @@ async fn reservation_metrics() {
     );
     assert_eq!(count("reserve_gas_requests_total", ""), 2);
     assert_eq!(count("reserve_gas_errors_total", ""), 2);
+    assert_eq!(count("reserve_gas_successes_total", ""), 0);
+    assert_eq!(count("execute_tx_successes_total", ""), 0);
 
     Mock::given(method("POST")).and(path("/v1/reserve_gas"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -425,6 +435,11 @@ async fn reservation_metrics() {
         "successful failover is not a client error"
     );
     assert_eq!(
+        count("reserve_gas_successes_total", ""),
+        1,
+        "successful failover is one successful client result"
+    );
+    assert_eq!(
         count(
             "backend_selector_calls_total",
             "algorithm=\"round_robin\",backend_name=\"a\""
@@ -439,6 +454,21 @@ async fn reservation_metrics() {
         1
     );
     assert_eq!(count("backend_registry_candidates", ""), 1);
+    assert_eq!(
+        count(
+            "reserve_gas_attempt_failures_total",
+            "backend=\"a\",reason=\"connection_refused\""
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            "reserve_gas_retries_total",
+            "backend=\"a\",reason=\"connection_refused\""
+        ),
+        1,
+        "a real failover attempt is attributed to the backend that failed"
+    );
     assert_eq!(
         count("storage_calls_total", "method=\"create_reservation\""),
         4
@@ -460,6 +490,21 @@ async fn reservation_metrics() {
         StatusCode::OK
     );
     assert_eq!(count("reserve_gas_errors_total", ""), 3);
+    assert_eq!(
+        count(
+            "reserve_gas_attempt_failures_total",
+            "backend=\"b\",reason=\"business_rejection\""
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            "reserve_gas_retries_total",
+            "backend=\"b\",reason=\"business_rejection\""
+        ),
+        0,
+        "retryable failure without an eligible peer must not count as an actual retry"
+    );
     upstream.verify().await;
     upstream.reset().await;
     Mock::given(method("POST"))
@@ -472,6 +517,21 @@ async fn reservation_metrics() {
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(count("reserve_gas_errors_total", ""), 4);
+    assert_eq!(
+        count(
+            "reserve_gas_attempt_failures_total",
+            "backend=\"b\",reason=\"http_error\""
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            "reserve_gas_retries_total",
+            "backend=\"b\",reason=\"http_error\""
+        ),
+        0,
+        "an ambiguous backend failure must not trigger a retry"
+    );
 
     registry.set_healthy("b", false);
     assert!(registry.candidates(&HashSet::new()).is_empty());
@@ -490,6 +550,11 @@ async fn reservation_metrics() {
     );
     assert_eq!(count("reserve_gas_requests_total", ""), 7);
     assert_eq!(count("reserve_gas_errors_total", ""), 6);
+    assert_eq!(
+        count("reserve_gas_successes_total", ""),
+        1,
+        "validation, business, backend, and availability errors must not count as successes"
+    );
     assert_eq!(count("backend_registry_candidates", ""), 0);
     assert_eq!(
         count(

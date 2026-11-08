@@ -9,7 +9,10 @@ use tokio::{
 };
 
 use super::registry::{Backend, BackendRegistry};
-use crate::config::{HealthChecksConfig, PassiveHealthCheckConfig};
+use crate::{
+    config::{HealthChecksConfig, PassiveHealthCheckConfig},
+    metrics,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendHealth {
@@ -22,6 +25,16 @@ pub enum BackendHealth {
 
     /// Backend is unreachable or repeatedly failing.
     Unhealthy,
+}
+
+impl BackendHealth {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Unhealthy => "unhealthy",
+        }
+    }
 }
 
 /// Reservation health observations are independent of whether retrying is safe.
@@ -71,7 +84,7 @@ impl HealthCheckOutcome {
         }
     }
 
-    pub(super) fn log_fields(self) -> (&'static str, Option<u16>) {
+    pub(crate) fn log_fields(self) -> (&'static str, Option<u16>) {
         match self {
             Self::HttpStatus(200) => ("http_ok", Some(200)),
             Self::HttpStatus(status) => ("http_error", Some(status)),
@@ -285,6 +298,7 @@ impl HealthState {
             return;
         }
         self.last_logged_health = health;
+        metrics::inc_backend_health_transition(backend, previous_health.label(), health.label());
         let milliseconds =
             |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         let cooldown_ms = self
@@ -328,6 +342,10 @@ impl HealthState {
         };
         self.success_count = 0;
         self.failure_count = 0;
+    }
+
+    pub(super) fn active_failure_count(&self) -> u32 {
+        self.failure_count
     }
 
     pub(super) fn record(

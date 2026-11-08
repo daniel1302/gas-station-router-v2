@@ -24,12 +24,19 @@ pub(super) async fn execute_transaction(
     {
         ExecutionReply::error(
             StatusCode::UNAUTHORIZED,
+            "unauthorized",
             "invalid or missing authorization token",
         )
+        .observed(None, None)
     } else if let Ok(Json(request)) = request {
         state.execution.execute(request).await
     } else {
-        ExecutionReply::error(StatusCode::BAD_REQUEST, "invalid execute_tx request")
+        ExecutionReply::error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid execute_tx request",
+        )
+        .observed(None, None)
     };
     (reply.status, Json(reply.body)).into_response()
 }

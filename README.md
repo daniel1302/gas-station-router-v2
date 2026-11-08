@@ -179,6 +179,26 @@ not attributed as the cause of cooldown recovery. Expiry while the backend remai
 `Unhealthy` does not produce a false recovery event. Authorization alerts retain
 their separate per-failure `ERROR` log and metric.
 
+Every failed active probe also emits `WARN Backend health check failed`, even
+before the unhealthy threshold is reached or when the backend is already
+unhealthy. It includes the backend, reason, HTTP status when available, current
+failure count, and threshold. Each failed upstream reservation attempt emits
+`WARN Backend reservation attempt failed` with its attempt number, failure kind,
+and whether the retry policy permits another attempt. A separate
+`WARN Retrying reservation on another backend` identifies actual retries and
+the backend selected for the next attempt.
+
+Execution failures emit `WARN Execution request failed` with a bounded reason,
+HTTP status, reservation ID, and transaction digest when available. An execution
+span carries the reservation ID and digest through the owned background task.
+Uncertain backend responses and failed IOTA RPC calls emit their own warnings,
+including backend, reason, HTTP status or JSON-RPC error code when available,
+and the next action. RPC recovery retries are logged as well. A failed transaction
+in finalized effects emits a warning even when its HTTP response is 200.
+Logs omit tokens, signatures, transaction bytes, raw upstream error text, response
+bodies, and request URLs. These warnings are available in both text and JSON
+logging; the default `INFO` filter includes `WARN`.
+
 The HTTP handler in `api::reservation` calls
 `ReservationService::reserve_with_retry()` for selection, retries and mapping
 storage; `reserve_once()` performs exactly one backend HTTP request.
@@ -462,17 +482,62 @@ All names below have the prefix `gas_station_router_`:
 | `backend_selector_calls_total` | `algorithm`, `backend_name` | Each selection, including retries; empty backend name means no candidate was selected. |
 | `backend_registry_candidates` | none | Gauge: the latest candidate count after enabled/health/retry filtering. |
 | `backend_authorization_errors_total` | `backend`, `status` | Backend reservation HTTP 401/403 responses, once per attempt; status is bounded to 401/403. |
+| `backend_health_transitions_total` | `backend`, `previous_health`, `health` | Effective state changes, including active/passive checks, cooldown expiry, and manual overrides; states are `healthy`, `degraded`, `unhealthy`. |
+| `backend_health_check_failures_total` | `backend`, `reason` | Every failed active probe, including failures before the threshold and while already unhealthy. |
 | `reserve_gas_requests_total` | none | Incoming reserve HTTP calls, including auth/validation rejections; retries do not add requests. |
 | `reserve_gas_errors_total` | none | Failed client responses, once per call; includes business errors returned with HTTP 200. |
+| `reserve_gas_successes_total` | none | Successful client responses after storing the reservation mapping, once per call; successful failover counts once. |
+| `reserve_gas_attempt_failures_total` | `backend`, `reason` | Every failed upstream reservation attempt, including business rejections and attempts followed by successful failover. |
+| `reserve_gas_retries_total` | `backend`, `reason` | Additional upstream attempts actually started; labels identify the failed backend and reason that caused the retry. |
+| `execute_tx_errors_total` | `reason` | Failed execution results, once per call, including auth/validation errors, storage failures, conflicts, timeouts, and finalized transaction failures returned with HTTP 200. |
+| `execute_tx_successes_total` | none | Successful execution results, once per call, including successful recovery and cache reads; finalized failed effects are excluded. |
+| `execute_tx_recovery_retries_total` | `backend`, `stage` | Additional RPC lookup rounds actually started after an inconclusive result; `stage` is `recovery` or `local_execution`. |
+
+Health transition counters increment only when the effective state changes. Failed
+active probes and passive reservation failures have separate counters. A cooldown
+expiry is counted when first observed, following the same rules as its transition
+log; scraping alone does not observe expiry or change counters.
+
+Reservation retry counters exclude the initial attempt, exhausted retry budgets,
+and retryable failures with no eligible next backend. Unsafe or ambiguous failures
+never authorize a retry. The retry counter increments after backoff, immediately
+before the additional upstream attempt begins.
+
+RPC retry counters exclude the initial lookup and increment when the next lookup
+round starts after backoff. A round may check both transaction effects and local
+indexing. They count read-only recovery/polling, including pending local execution,
+and never imply another Gas Station execution POST.
+
+Execution errors include both execution endpoint aliases. Successful recovery does
+not increment the final error counter, although intermediate failures still emit
+warnings. Each response containing finalized failed effects counts, including
+cache reads. The owned execution task records its final result even if the client
+disconnects. Invalid HTTP requests are counted by the API handler; service results
+are counted by the service, so a single request is not counted twice.
+
+Success counters are initialized to zero and count successful request results,
+not unique on-chain transactions. A reservation counts only after its mapping is
+stored and the router returns a successful response without a business error.
+An execution counts when it returns successful effects and satisfies the requested
+confirmation mode. Each successful cache read counts as one success; retries
+within a single request do not add successes. Finalized failed effects returned
+with HTTP 200 increment only the execution error counter.
+
+Health probe reasons are `http_error`, `connection_refused`, `connection_timeout`,
+`request_timeout`, `connection_error`, and `transport_error`. Reservation reasons
+also distinguish `invalid_response`, `redirect`, `authorization_error`,
+`invalid_request`, `rate_limited`, `no_gas_coins`, `maintenance`, `daily_cap`, and
+`business_rejection`. Reasons are fixed categories, never upstream error strings.
 
 These storage counters describe events, not live cache sizes or current phase
 populations. `storage_health_checks_total` is a result counter, not a health
 gauge. A claim conflict is an ordinary claim outcome; it increments
 `storage_errors_total` only when an operation actually returns `Err`.
-The existing `gas_station_router_up` gauge is also retained. Authorization counters
-are initialized to zero for each configured backend and both statuses, so the first
-authorization failure is observable as an increment. Other backend label series
-appear on first use; fixed label sets are initialized to zero.
+The existing `gas_station_router_up` gauge is also retained. Health, authorization,
+reservation attempt/retry, and execution recovery retry series are initialized to
+zero for each configured backend and their bounded labels, so the first event is
+observable as an increment. Other backend label series appear on first use; fixed
+label sets are initialized to zero. Log filters do not affect metric increments.
 
 ```sh
 cargo fmt --all -- --check
