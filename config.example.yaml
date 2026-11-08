@@ -46,7 +46,9 @@ health_checks:
   passive:
     enabled: true
     failure_threshold: 3
-    cooldown: 15s
+    initial_cooldown: 15s
+    backoff: 2
+    max_cooldown: 60s
 
   deep_check:
     enabled: false

@@ -178,7 +178,13 @@ pub(super) struct HealthState {
     success_count: u32,
     failure_count: u32,
     reservation_failure_count: u32,
-    cooldown_started: Option<Instant>,
+    // Retain the last cooldown after expiry to grow the next one until a successful reservation.
+    cooldown: Option<Cooldown>,
+}
+
+struct Cooldown {
+    started: Instant,
+    duration: Duration,
 }
 
 impl HealthState {
@@ -188,17 +194,20 @@ impl HealthState {
             success_count: 0,
             failure_count: 0,
             reservation_failure_count: 0,
-            cooldown_started: None,
+            cooldown: None,
         }
     }
 
-    pub(super) fn status(&self, cooldown: Duration) -> BackendHealth {
+    fn cooldown_active(&self) -> bool {
+        self.cooldown
+            .as_ref()
+            .is_some_and(|cooldown| cooldown.started.elapsed() < cooldown.duration)
+    }
+
+    pub(super) fn status(&self) -> BackendHealth {
         if self.health == BackendHealth::Unhealthy {
             BackendHealth::Unhealthy
-        } else if self
-            .cooldown_started
-            .is_some_and(|start| start.elapsed() < cooldown)
-        {
+        } else if self.cooldown_active() {
             BackendHealth::Degraded
         } else {
             BackendHealth::Healthy
@@ -220,9 +229,8 @@ impl HealthState {
         success: bool,
         healthy_threshold: u32,
         unhealthy_threshold: u32,
-        cooldown: Duration,
     ) -> Option<BackendHealth> {
-        let previous = self.status(cooldown);
+        let previous = self.status();
         if success {
             self.failure_count = 0;
             self.success_count = self.success_count.saturating_add(1);
@@ -236,7 +244,7 @@ impl HealthState {
                 self.health = BackendHealth::Unhealthy;
             }
         }
-        let current = self.status(cooldown);
+        let current = self.status();
         (current != previous).then_some(current)
     }
 
@@ -248,12 +256,15 @@ impl HealthState {
         if !config.enabled {
             return None;
         }
-        let previous = self.status(config.cooldown);
+        let previous = self.status();
         match outcome {
             ReservationOutcome::Success => {
                 // An already in-flight success must not undo a newer cooldown
                 // or bypass the background checker's recovery threshold.
                 self.reservation_failure_count = 0;
+                if !self.cooldown_active() {
+                    self.cooldown = None;
+                }
             }
             ReservationOutcome::BackendFailure => {
                 self.reservation_failure_count = self.reservation_failure_count.saturating_add(1);
@@ -263,11 +274,51 @@ impl HealthState {
                 }
             }
             ReservationOutcome::NoGasCoins => {
-                self.cooldown_started = Some(Instant::now());
+                let duration = self
+                    .cooldown
+                    .as_ref()
+                    .map_or(config.initial_cooldown, |last| {
+                        last.duration
+                            .saturating_mul(config.backoff)
+                            .min(config.max_cooldown)
+                    });
+                self.cooldown = Some(Cooldown {
+                    started: Instant::now(),
+                    duration,
+                });
             }
             ReservationOutcome::AuthorizationFailure(_) | ReservationOutcome::Neutral => {}
         }
-        let current = self.status(config.cooldown);
+        let current = self.status();
         (current != previous).then_some(current)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cooldown_growth_cannot_overflow_and_still_respects_the_cap() {
+        let config = PassiveHealthCheckConfig {
+            initial_cooldown: Duration::MAX / 2,
+            backoff: u32::MAX,
+            max_cooldown: Duration::MAX - Duration::from_secs(1),
+            ..PassiveHealthCheckConfig::default()
+        };
+        let mut state = HealthState::new();
+        state.record_reservation(ReservationOutcome::NoGasCoins, &config);
+        assert_eq!(state.status(), BackendHealth::Degraded);
+        state.record_reservation(ReservationOutcome::NoGasCoins, &config);
+        assert_eq!(
+            state.cooldown.as_ref().unwrap().duration,
+            config.max_cooldown
+        );
+        state.record_reservation(ReservationOutcome::NoGasCoins, &config);
+        assert_eq!(
+            state.cooldown.as_ref().unwrap().duration,
+            config.max_cooldown
+        );
+        assert_eq!(state.status(), BackendHealth::Degraded);
     }
 }

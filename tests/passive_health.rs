@@ -105,6 +105,15 @@ async fn mock(server: &MockServer, response: ResponseTemplate, calls: u64) {
         .await;
 }
 
+async fn expire_cooldown(registry: &BackendRegistry, name: &str, seconds: u64) {
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(seconds - 1)).await;
+    assert_eq!(registry.health(name), Some(BackendHealth::Degraded));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(registry.health(name), Some(BackendHealth::Healthy));
+    tokio::time::resume();
+}
+
 #[tokio::test]
 async fn server_failures_reach_the_threshold_and_success_resets_the_counter() {
     let server = MockServer::start().await;
@@ -411,6 +420,157 @@ async fn no_coins_causes_cooldown_survives_active_probes_and_routes_to_another_b
 }
 
 #[tokio::test]
+async fn repeated_capacity_rejections_back_off_to_the_cap_despite_successful_probes() {
+    for (backoff, durations) in [
+        (3, [2, 6, 10, 10]),
+        (1, [2, 2, 2, 2]),
+        (u32::MAX, [2, 10, 10, 10]),
+    ] {
+        let server = MockServer::start().await;
+        mock(
+            &server,
+            ResponseTemplate::new(500).set_body_json(rejected(NO_COINS)),
+            4,
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(8)
+            .mount(&server)
+            .await;
+        let (router, registry, _) = setup(
+            &[backend("a", server.uri())],
+            PassiveHealthCheckConfig {
+                initial_cooldown: Duration::from_secs(2),
+                backoff,
+                max_cooldown: Duration::from_secs(10),
+                ..PassiveHealthCheckConfig::default()
+            },
+            Duration::from_secs(1),
+            0,
+        );
+        let checker =
+            BackgroundHealthChecker::new(registry.clone(), HealthChecksConfig::default()).unwrap();
+        for seconds in durations {
+            assert_eq!(
+                reserve(router.clone(), 1).await.0,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert_eq!(registry.health("a"), Some(BackendHealth::Degraded));
+            assert!(registry.candidates(&HashSet::new()).is_empty());
+            assert_eq!(
+                reserve(router.clone(), 1).await.0,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+            checker.check_once().await.unwrap();
+            checker.check_once().await.unwrap();
+            expire_cooldown(&registry, "a", seconds).await;
+            assert_eq!(registry.candidates(&HashSet::new()).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn only_a_successful_reservation_after_cooldown_resets_backoff() {
+    let server = MockServer::start().await;
+    let responses = Arc::new(Mutex::new(VecDeque::from([
+        ResponseTemplate::new(500).set_body_json(rejected(NO_COINS)),
+        ResponseTemplate::new(400).set_body_json(rejected("Invalid request")),
+        ResponseTemplate::new(500).set_body_json(rejected(NO_COINS)),
+        ResponseTemplate::new(200).set_body_json(success(4)),
+        ResponseTemplate::new(500).set_body_json(rejected(NO_COINS)),
+    ])));
+    Mock::given(method("POST"))
+        .and(path("/v1/reserve_gas"))
+        .respond_with(move |_: &wiremock::Request| responses.lock().unwrap().pop_front().unwrap())
+        .expect(5)
+        .mount(&server)
+        .await;
+    let (router, registry, _) = setup(
+        &[backend("a", server.uri())],
+        PassiveHealthCheckConfig {
+            initial_cooldown: Duration::from_secs(2),
+            backoff: 3,
+            max_cooldown: Duration::from_secs(10),
+            ..PassiveHealthCheckConfig::default()
+        },
+        Duration::from_secs(1),
+        0,
+    );
+    assert_eq!(
+        reserve(router.clone(), 1).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    expire_cooldown(&registry, "a", 2).await;
+    assert_eq!(reserve(router.clone(), 1).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(registry.health("a"), Some(BackendHealth::Healthy));
+    assert_eq!(
+        reserve(router.clone(), 1).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    expire_cooldown(&registry, "a", 6).await;
+    assert_eq!(reserve(router.clone(), 1).await.0, StatusCode::OK);
+    assert_eq!(
+        reserve(router, 1).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    expire_cooldown(&registry, "a", 2).await;
+}
+
+#[tokio::test]
+async fn cooldown_backoff_is_independent_for_each_backend() {
+    let a = MockServer::start().await;
+    let b = MockServer::start().await;
+    mock(
+        &a,
+        ResponseTemplate::new(500).set_body_json(rejected(NO_COINS)),
+        2,
+    )
+    .await;
+    for (budget, status, body) in [(2, 200, success(2)), (4, 500, rejected(NO_COINS))] {
+        Mock::given(method("POST"))
+            .and(body_json(
+                json!({"gas_budget": budget, "reserve_duration_secs": 5}),
+            ))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .expect(1)
+            .mount(&b)
+            .await;
+    }
+    let (router, registry, _) = setup(
+        &[backend("a", a.uri()), backend("b", b.uri())],
+        PassiveHealthCheckConfig {
+            initial_cooldown: Duration::from_secs(2),
+            backoff: 3,
+            max_cooldown: Duration::from_secs(10),
+            ..PassiveHealthCheckConfig::default()
+        },
+        Duration::from_secs(1),
+        0,
+    );
+    assert_eq!(
+        reserve(router.clone(), 1).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(reserve(router.clone(), 2).await.0, StatusCode::OK);
+    expire_cooldown(&registry, "a", 2).await;
+    assert_eq!(
+        reserve(router.clone(), 3).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        reserve(router, 4).await.0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    expire_cooldown(&registry, "b", 2).await;
+    assert_eq!(registry.health("a"), Some(BackendHealth::Degraded));
+    let candidates = registry.candidates(&HashSet::new());
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].name, "b");
+}
+
+#[tokio::test]
 async fn an_older_inflight_success_does_not_clear_a_newer_cooldown() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -430,7 +590,7 @@ async fn an_older_inflight_success_does_not_clear_a_newer_cooldown() {
             json!({"gas_budget": 2, "reserve_duration_secs": 5}),
         ))
         .respond_with(ResponseTemplate::new(500).set_body_json(rejected(NO_COINS)))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     let (router, registry, _) = setup(
@@ -447,10 +607,13 @@ async fn an_older_inflight_success_does_not_clear_a_newer_cooldown() {
     })
     .await
     .unwrap();
-    reserve(router, 2).await;
+    reserve(router.clone(), 2).await;
     assert_eq!(registry.health("a"), Some(BackendHealth::Degraded));
     assert_eq!(older.await.unwrap().0, StatusCode::OK);
     assert_eq!(registry.health("a"), Some(BackendHealth::Degraded));
+    expire_cooldown(&registry, "a", 15).await;
+    reserve(router, 2).await;
+    expire_cooldown(&registry, "a", 30).await;
 }
 
 #[tokio::test]
@@ -504,7 +667,9 @@ async fn disabled_passive_checks_do_not_exclude_backends() {
             PassiveHealthCheckConfig {
                 enabled: false,
                 failure_threshold: 0,
-                cooldown: Duration::ZERO,
+                initial_cooldown: Duration::ZERO,
+                backoff: 0,
+                max_cooldown: Duration::ZERO,
             },
             Duration::from_secs(1),
             0,
@@ -517,7 +682,7 @@ async fn disabled_passive_checks_do_not_exclude_backends() {
 }
 
 #[test]
-fn enabled_passive_checks_reject_zero_threshold_and_cooldown() {
+fn enabled_passive_checks_reject_invalid_cooldown_settings() {
     for (field, config) in [
         (
             "failure_threshold",
@@ -527,9 +692,30 @@ fn enabled_passive_checks_reject_zero_threshold_and_cooldown() {
             },
         ),
         (
-            "cooldown",
+            "initial_cooldown",
             PassiveHealthCheckConfig {
-                cooldown: Duration::ZERO,
+                initial_cooldown: Duration::ZERO,
+                ..PassiveHealthCheckConfig::default()
+            },
+        ),
+        (
+            "backoff",
+            PassiveHealthCheckConfig {
+                backoff: 0,
+                ..PassiveHealthCheckConfig::default()
+            },
+        ),
+        (
+            "max_cooldown",
+            PassiveHealthCheckConfig {
+                max_cooldown: Duration::ZERO,
+                ..PassiveHealthCheckConfig::default()
+            },
+        ),
+        (
+            "max_cooldown",
+            PassiveHealthCheckConfig {
+                max_cooldown: Duration::from_secs(14),
                 ..PassiveHealthCheckConfig::default()
             },
         ),

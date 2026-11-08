@@ -123,12 +123,26 @@ bodies are excluded. Client authorization failures at the router do not trigger
 backend authorization alerts.
 
 The exact negative-envelope error `Unable to reserve gas coins for the given budget.`
-marks the backend `Degraded` for `passive.cooldown` (default `15s`), without counting
-it as a backend failure. During cooldown it receives no new reservations. Successful
-active probes or already in-flight reservations cannot shorten cooldown. After it
-expires, the backend is eligible again if active checks have not marked it
-`Unhealthy`. Existing reservation mappings are preserved. Enabled passive checks
-require a positive failure threshold and cooldown.
+marks the backend `Degraded`, without counting it as a backend failure. The first
+cooldown lasts `passive.initial_cooldown` (default `15s`). Each subsequent rejection
+multiplies the last duration by the integer `passive.backoff` (default `2`), capped at
+`passive.max_cooldown` (default `60s`): `15s`, `30s`, `60s`, `60s`, and so on.
+Each backend tracks its own cooldown. A further rejection from an already in-flight
+request also increases the duration and restarts the timer. Multiplication saturates
+before applying the cap, so large values cannot overflow.
+
+During cooldown the backend receives no new reservations. Successful active probes
+or already in-flight reservations cannot shorten cooldown or reset its backoff.
+After it expires, the backend is eligible again if active checks have not marked it
+`Unhealthy`. Expiry alone does not reset backoff: a successful reservation after
+expiry resets it, so the next cooldown starts at `initial_cooldown` again. Existing
+reservation mappings are preserved.
+
+Enabled passive checks require a positive failure threshold and `initial_cooldown`,
+`backoff` of at least `1`, and `max_cooldown` at least as long as `initial_cooldown`.
+Use `backoff: 1` for a fixed cooldown. The old `passive.cooldown` key has been renamed
+to `passive.initial_cooldown`; update existing configs and add `backoff` and
+`max_cooldown`. The old key is rejected as an unknown field.
 
 The HTTP handler in `api::reservation` calls
 `ReservationService::reserve_with_retry()` for selection, retries and mapping

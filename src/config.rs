@@ -187,7 +187,11 @@ pub struct PassiveHealthCheckConfig {
     pub enabled: bool,
     pub failure_threshold: u32,
     #[serde(with = "humantime_serde")]
-    pub cooldown: Duration,
+    pub initial_cooldown: Duration,
+    /// Integer multiplier applied after each further insufficient-coins rejection.
+    pub backoff: u32,
+    #[serde(with = "humantime_serde")]
+    pub max_cooldown: Duration,
 }
 
 impl Default for PassiveHealthCheckConfig {
@@ -195,7 +199,9 @@ impl Default for PassiveHealthCheckConfig {
         Self {
             enabled: true,
             failure_threshold: 3,
-            cooldown: Duration::from_secs(15),
+            initial_cooldown: Duration::from_secs(15),
+            backoff: 2,
+            max_cooldown: Duration::from_secs(60),
         }
     }
 }
@@ -329,7 +335,12 @@ mod tests {
         );
         for (field, invalid) in [
             ("timeout: 1500ms", "timeout: invalid"),
-            ("cooldown: 15s", "cooldown: invalid"),
+            ("initial_cooldown: 15s", "initial_cooldown: invalid"),
+            ("max_cooldown: 60s", "max_cooldown: invalid"),
+            ("initial_cooldown: 15s", "cooldown: 15s"),
+            ("backoff: 2\n", "backoff: invalid\n"),
+            ("backoff: 2\n", "backoff: 1.5\n"),
+            ("backoff: 2\n", "backoff: -1\n"),
             ("interval: 60s", "interval: invalid"),
             ("unhealthy_threshold:", "unhealthy_threshhold:"),
             ("failure_threshold:", "failure_threshhold:"),
@@ -349,11 +360,23 @@ mod tests {
             &yaml
                 .replace("timeout: 1500ms", "timeout: 250ms")
                 .replace("failure_threshold: 3", "failure_threshold: 7")
+                .replace("initial_cooldown: 15s", "initial_cooldown: 4s")
+                .replace("backoff: 2\n", "backoff: 3\n")
+                .replace("max_cooldown: 60s", "max_cooldown: 40s")
                 .replace("interval: 60s", "interval: 90s"),
         )
         .unwrap();
         assert_eq!(config.health_checks.timeout, Duration::from_millis(250));
         assert_eq!(config.health_checks.passive.failure_threshold, 7);
+        assert_eq!(
+            config.health_checks.passive.initial_cooldown,
+            Duration::from_secs(4)
+        );
+        assert_eq!(config.health_checks.passive.backoff, 3);
+        assert_eq!(
+            config.health_checks.passive.max_cooldown,
+            Duration::from_secs(40)
+        );
         assert_eq!(
             config.health_checks.deep_check.interval,
             Duration::from_secs(90)

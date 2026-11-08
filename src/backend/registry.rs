@@ -47,8 +47,16 @@ impl BackendRegistry {
                 "health_checks.passive.failure_threshold must be greater than zero"
             );
             ensure!(
-                !passive.cooldown.is_zero(),
-                "health_checks.passive.cooldown must be greater than zero"
+                !passive.initial_cooldown.is_zero(),
+                "health_checks.passive.initial_cooldown must be greater than zero"
+            );
+            ensure!(
+                passive.backoff >= 1,
+                "health_checks.passive.backoff must be at least 1"
+            );
+            ensure!(
+                passive.max_cooldown >= passive.initial_cooldown,
+                "health_checks.passive.max_cooldown must be at least initial_cooldown"
             );
         }
         let mut names = HashSet::new();
@@ -154,14 +162,14 @@ impl Backend {
         self.health
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .status(self.passive.cooldown)
+            .status()
     }
 
     /// Passive health checks based on the outcome of `reserve_gas`.
     ///
     /// | `reserve_gas` outcome | Reaction |
     /// | --- | --- |
-    /// | Success | Reset the reservation failure counter |
+    /// | Success | Reset the reservation failure counter and, after cooldown expires, reset cooldown backoff |
     /// | Connection refused / timeout | Increment the failure counter |
     /// | HTTP 500/502/503/504 | Increment the failure counter, accounting for known business errors |
     /// | HTTP 400 | Do not mark the backend as `Unhealthy` |
@@ -170,6 +178,8 @@ impl Backend {
     ///
     /// Insufficient gas coins are detected from a `reserve_gas` error for the requested
     /// budget, without reading coin counts from metrics.
+    /// Cooldowns start at `initial_cooldown`, grow by the integer `backoff` multiplier
+    /// on subsequent rejections and are capped at `max_cooldown`.
     pub(crate) fn record_reservation_outcome(&self, outcome: ReservationOutcome) {
         if let ReservationOutcome::AuthorizationFailure(status) = outcome {
             metrics::inc_backend_authorization_error(&self.name, status);
@@ -200,12 +210,7 @@ impl Backend {
             .health
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .record(
-                success,
-                healthy_threshold,
-                unhealthy_threshold,
-                self.passive.cooldown,
-            );
+            .record(success, healthy_threshold, unhealthy_threshold);
         if let Some(health) = transition {
             tracing::info!(backend = %self.name, ?health, "Backend health changed");
         }
