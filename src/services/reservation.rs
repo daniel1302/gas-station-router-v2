@@ -9,7 +9,10 @@ use serde_json::{Value, json};
 use tokio::time::sleep;
 
 use crate::{
-    backend::registry::{Backend, BackendRegistry},
+    backend::{
+        health::ReservationOutcome,
+        registry::{Backend, BackendRegistry},
+    },
     config::ReserveGasConfig,
     routing::BackendSelector,
     storage::{Reservation, Storage},
@@ -71,6 +74,7 @@ impl ReserveError {
 struct ReserveFailure {
     kind: ReserveError,
     reply: ReserveReply,
+    outcome: ReservationOutcome,
 }
 
 struct UpstreamReservation {
@@ -173,9 +177,7 @@ impl ReservationService {
             let mut reserved = match self.reserve_once(&backend, request).await {
                 Ok(reserved) => reserved,
                 Err(failure) => {
-                    if failure.kind == ReserveError::ConnectionFailed {
-                        self.registry.set_healthy(&backend.name, false);
-                    }
+                    backend.record_reservation_outcome(failure.outcome);
                     if !failure.kind.is_retryable() || attempt == self.config.retries.max_retries {
                         return failure.reply;
                     }
@@ -184,6 +186,7 @@ impl ReservationService {
                     continue;
                 }
             };
+            backend.record_reservation_outcome(ReservationOutcome::Success);
             let id = match self
                 .storage
                 .create_reservation(
@@ -227,6 +230,7 @@ impl ReservationService {
         if status.is_redirection() {
             return Err(ReserveFailure {
                 kind: ReserveError::Permanent,
+                outcome: ReservationOutcome::Neutral,
                 reply: ReserveReply::error(
                     StatusCode::BAD_GATEWAY,
                     "backend redirects are not supported",
@@ -236,7 +240,7 @@ impl ReservationService {
         let body = response
             .json::<Value>()
             .await
-            .map_err(ReserveFailure::transport)?;
+            .map_err(|error| ReserveFailure::response_transport(error, status))?;
         let reply = ReserveReply { status, body };
         if let Ok(response) = serde_json::from_value::<ReserveGasResponse>(reply.body.clone()) {
             if let Some(error) = response.error.as_deref()
@@ -245,6 +249,7 @@ impl ReservationService {
             {
                 return Err(ReserveFailure {
                     kind: rejection_kind(status, error),
+                    outcome: http_failure_outcome(status, Some(error)),
                     reply,
                 });
             }
@@ -260,6 +265,7 @@ impl ReservationService {
             }
         }
         Err(ReserveFailure {
+            outcome: http_failure_outcome(status, None),
             kind: if status.is_client_error() {
                 ReserveError::Permanent
             } else {
@@ -278,9 +284,24 @@ impl ReservationService {
 }
 
 impl ReserveFailure {
+    fn response_transport(error: reqwest::Error, status: StatusCode) -> Self {
+        let mut failure = Self::transport(error);
+        // Once headers are known, 4xx and auth errors must not turn into
+        // backend failures just because their error body is malformed or slow.
+        if !status.is_success() {
+            failure.outcome = http_failure_outcome(status, None);
+        }
+        failure
+    }
+
     fn transport(error: reqwest::Error) -> Self {
         // A connect timeout happens before delivery. A response/body timeout may
         // happen after reservation creation and must never cause another POST.
+        let outcome = if error.is_connect() || error.is_timeout() {
+            ReservationOutcome::BackendFailure
+        } else {
+            ReservationOutcome::Neutral
+        };
         let kind = if error.is_connect() {
             ReserveError::ConnectionFailed
         } else if error.is_builder() {
@@ -301,7 +322,43 @@ impl ReserveFailure {
                 "invalid or interrupted backend response",
             )
         };
-        Self { kind, reply }
+        Self {
+            kind,
+            reply,
+            outcome,
+        }
+    }
+}
+
+fn http_failure_outcome(status: StatusCode, rejection: Option<&str>) -> ReservationOutcome {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+            return ReservationOutcome::AuthorizationFailure(status.as_u16());
+        }
+        status if status.is_client_error() && status != StatusCode::TOO_MANY_REQUESTS => {
+            return ReservationOutcome::Neutral;
+        }
+        _ => {}
+    }
+    // Only a validated negative envelope may identify a capacity/business error.
+    // A generic 5xx is evidence of a fault, but still does not make POST retry safe.
+    match rejection {
+        Some("Unable to reserve gas coins for the given budget.") => ReservationOutcome::NoGasCoins,
+        Some(
+            "Gas station is in maintenance mode. Please try again later."
+            | "Gas usage exceeds daily cap",
+        ) => ReservationOutcome::Neutral,
+        _ if matches!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        ) =>
+        {
+            ReservationOutcome::BackendFailure
+        }
+        _ => ReservationOutcome::Neutral,
     }
 }
 

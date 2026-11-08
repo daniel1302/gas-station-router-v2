@@ -1,0 +1,77 @@
+name: gas-station-router-v2-e2e
+
+x-gas-station: &gas-station
+  image: gas-station-router-v2-e2e-backend:local
+  build:
+    context: ${GAS_STATION_SOURCE:-../../gas-station}
+    dockerfile_inline: |
+      FROM rust:1.95-bookworm AS builder
+      RUN apt-get update && apt-get install -y --no-install-recommends clang pkg-config libssl-dev \
+          && rm -rf /var/lib/apt/lists/*
+      WORKDIR /build
+      ENV GIT_REVISION=local-e2e CARGO_BUILD_JOBS=8
+      COPY Cargo.toml Cargo.lock ./
+      COPY src ./src
+      RUN --mount=type=cache,target=/usr/local/cargo/registry \
+          --mount=type=cache,target=/usr/local/cargo/git \
+          cargo build --locked --release --bin iota-gas-station
+      FROM debian:bookworm-slim
+      RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 libjemalloc2 \
+          && rm -rf /var/lib/apt/lists/*
+      COPY --from=builder /build/target/release/iota-gas-station /usr/local/bin/entrypoint
+  entrypoint: ["/bin/sh", "/config/gas-station-entrypoint.sh"]
+  depends_on:
+    redis:
+      condition: service_healthy
+  volumes:
+    - ./gas-station-entrypoint.sh:/config/gas-station-entrypoint.sh:ro
+    - ./gas-station.config.yaml:/config/gas-station.config.yaml:ro
+  tmpfs:
+    - /run/gas-station:mode=0700
+  restart: unless-stopped
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    restart: unless-stopped
+
+  gas-station-1:
+    <<: *gas-station
+    ports: ["127.0.0.1:9527:9527"]
+    environment:
+      GAS_STATION_PRIVATE_KEY: ${GAS_STATION_1_PRIVATE_KEY:?Run cargo run --example e2e -- init first}
+      GAS_STATION_AUTH: ${GS_AUTH:?Set GS_AUTH in docker/.env}
+      IOTA_GRPC_URL: ${IOTA_GRPC_URL:-https://grpc.testnet.iota.cafe}
+      REDIS_DB: "1"
+      RUST_LOG: info
+
+  gas-station-2:
+    <<: *gas-station
+    ports: ["127.0.0.1:9528:9527"]
+    environment:
+      GAS_STATION_PRIVATE_KEY: ${GAS_STATION_2_PRIVATE_KEY:?Run cargo run --example e2e -- init first}
+      GAS_STATION_AUTH: ${GS_AUTH:?Set GS_AUTH in docker/.env}
+      IOTA_GRPC_URL: ${IOTA_GRPC_URL:-https://grpc.testnet.iota.cafe}
+      REDIS_DB: "2"
+      RUST_LOG: info
+
+  gas-station-3:
+    <<: *gas-station
+    ports: ["127.0.0.1:9529:9527"]
+    environment:
+      GAS_STATION_PRIVATE_KEY: ${GAS_STATION_3_PRIVATE_KEY:?Run cargo run --example e2e -- init first}
+      GAS_STATION_AUTH: ${GS_AUTH:?Set GS_AUTH in docker/.env}
+      IOTA_GRPC_URL: ${IOTA_GRPC_URL:-https://grpc.testnet.iota.cafe}
+      REDIS_DB: "3"
+      RUST_LOG: info
+
+volumes:
+  redis-data:

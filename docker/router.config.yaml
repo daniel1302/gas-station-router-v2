@@ -1,0 +1,58 @@
+# Run the router on the host: cargo run -- start --config-file docker/router.config.yaml
+rpc:
+  host: 127.0.0.1
+  port: 9257
+  token: ${GS_AUTH}
+metrics:
+  host: 127.0.0.1
+  port: 9184
+iota:
+  rpc_url: ${IOTA_RPC_URL}
+  timeout: 10s
+storage:
+  kind: memory
+routing:
+  algorithm: round_robin
+  reserve_gas:
+    timeout: 10s
+    retries:
+      max_retries: 2
+      backoff: 200ms
+  execute_tx:
+    timeout: 60s
+    inflight:
+      lease_ttl: 75s
+      record_ttl: 30m
+  ttl:
+    reservation: 15m
+    transaction_effects: 30m
+health_checks:
+  enabled: true
+  interval: 5s
+  timeout: 1500ms
+
+  unhealthy_threshold: 3
+  healthy_threshold: 2
+
+  passive:
+    enabled: true
+    failure_threshold: 3
+    initial_cooldown: 15s
+    backoff: 2
+    max_cooldown: 60s
+
+  deep_check:
+    enabled: false
+    interval: 60s
+    timeout: 5s
+
+backends:
+  - name: gas_station_1
+    token: ${GS_AUTH}
+    rpc: http://127.0.0.1:9527
+  - name: gas_station_2
+    token: ${GS_AUTH}
+    rpc: http://127.0.0.1:9528
+  - name: gas_station_3
+    token: ${GS_AUTH}
+    rpc: http://127.0.0.1:9529

@@ -15,8 +15,8 @@ use axum::{
 };
 use gas_station_router_v2::{
     api,
-    backend::registry::BackendRegistry,
-    config::{BackendConfig, ReserveGasConfig, RetryConfig},
+    backend::{health::BackgroundHealthChecker, registry::BackendRegistry},
+    config::{BackendConfig, HealthChecksConfig, ReserveGasConfig, RetryConfig},
     routing::{BackendCandidate, BackendSelector, round_robin::RoundRobinSelector},
     services::reservation::{ReservationService, ReserveError, http_client},
     storage::{
@@ -258,7 +258,7 @@ async fn retries_connect_error_on_b_without_skipping_to_c() {
     assert_eq!(mapping.backend, "b");
     assert_eq!(mapping.upstream_reservation_id, 200);
     assert!(
-        !registry
+        registry
             .candidates(&HashSet::new())
             .iter()
             .any(|candidate| candidate.name == "a")
@@ -357,8 +357,13 @@ async fn explicit_reservation_rejections_fail_over_and_store_only_the_success() 
             .unwrap();
         assert_eq!(mapping.backend, "b");
         assert_eq!(mapping.upstream_reservation_id, 20);
-        // A rejection only excludes the backend from this request.
-        assert_eq!(registry.candidates(&HashSet::new()).len(), 2);
+        // Capacity rejection additionally excludes the backend during cooldown.
+        let expected = if error == "Unable to reserve gas coins for the given budget." {
+            1
+        } else {
+            2
+        };
+        assert_eq!(registry.candidates(&HashSet::new()).len(), expected);
     }
 }
 
@@ -586,6 +591,41 @@ async fn redirects_are_not_followed() {
 }
 
 #[tokio::test]
+async fn upstream_success_resets_passive_failures_even_if_mapping_storage_fails() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                ResponseTemplate::new(200).set_body_json(success(42))
+            } else {
+                ResponseTemplate::new(500)
+                    .set_body_json(json!({"result": null, "error": "Redis unavailable"}))
+            }
+        })
+        .expect(4)
+        .mount(&server)
+        .await;
+    let storage = Arc::new(UnavailableStorage::default());
+    let (router, registry) = app(
+        vec![backend("a", server.uri())],
+        storage.clone(),
+        settings(0, Duration::from_secs(1)),
+        "",
+    );
+    for expected in [
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        assert_eq!(send(router.clone(), request(), None).await.0, expected);
+        assert_eq!(registry.candidates(&HashSet::new()).len(), 1);
+    }
+    assert_eq!(storage.writes.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
 async fn authentication_and_request_validation_happen_before_forwarding() {
     let a = MockServer::start().await;
     mock_reservation(&a, ResponseTemplate::new(200).set_body_json(success(1)), 0).await;
@@ -638,13 +678,20 @@ async fn health_probes_filter_failed_backends_and_allow_recovery() {
         .await;
     let mut disabled = backend("c", c.uri());
     disabled.enabled = false;
-    let registry =
-        BackendRegistry::new(&[backend("a", a.uri()), backend("b", b.uri()), disabled]).unwrap();
+    let registry = Arc::new(
+        BackendRegistry::new(&[backend("a", a.uri()), backend("b", b.uri()), disabled]).unwrap(),
+    );
     assert_eq!(registry.candidates(&HashSet::new()).len(), 2);
-    let client = http_client(Duration::from_secs(1)).unwrap();
-    registry
-        .refresh_health(&client, Duration::from_secs(1))
-        .await;
+    let checker = BackgroundHealthChecker::new(
+        registry.clone(),
+        HealthChecksConfig {
+            unhealthy_threshold: 1,
+            healthy_threshold: 1,
+            ..HealthChecksConfig::default()
+        },
+    )
+    .unwrap();
+    checker.check_once().await.unwrap();
     assert_eq!(
         registry
             .candidates(&HashSet::new())
@@ -660,9 +707,7 @@ async fn health_probes_filter_failed_backends_and_allow_recovery() {
         .expect(1)
         .mount(&b)
         .await;
-    registry
-        .refresh_health(&client, Duration::from_secs(1))
-        .await;
+    checker.check_once().await.unwrap();
     assert_eq!(
         registry
             .candidates(&HashSet::new())

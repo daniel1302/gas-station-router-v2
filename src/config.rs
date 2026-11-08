@@ -18,6 +18,8 @@ pub struct Config {
     pub iota: IotaConfig,
     pub storage: StorageConfig,
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub health_checks: HealthChecksConfig,
     pub backends: Vec<BackendConfig>,
 }
 
@@ -151,6 +153,79 @@ pub struct TtlConfig {
     pub transaction_effects: Duration,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HealthChecksConfig {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+    pub unhealthy_threshold: u32,
+    pub healthy_threshold: u32,
+    pub passive: PassiveHealthCheckConfig,
+    pub deep_check: DeepHealthCheckConfig,
+}
+
+impl Default for HealthChecksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval: Duration::from_secs(5),
+            timeout: Duration::from_millis(1500),
+            unhealthy_threshold: 3,
+            healthy_threshold: 2,
+            passive: PassiveHealthCheckConfig::default(),
+            deep_check: DeepHealthCheckConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PassiveHealthCheckConfig {
+    pub enabled: bool,
+    pub failure_threshold: u32,
+    #[serde(with = "humantime_serde")]
+    pub initial_cooldown: Duration,
+    /// Integer multiplier applied after each further insufficient-coins rejection.
+    pub backoff: u32,
+    #[serde(with = "humantime_serde")]
+    pub max_cooldown: Duration,
+}
+
+impl Default for PassiveHealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failure_threshold: 3,
+            initial_cooldown: Duration::from_secs(15),
+            backoff: 2,
+            max_cooldown: Duration::from_secs(60),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeepHealthCheckConfig {
+    pub enabled: bool,
+    #[serde(with = "humantime_serde")]
+    pub interval: Duration,
+    #[serde(with = "humantime_serde")]
+    pub timeout: Duration,
+}
+
+impl Default for DeepHealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval: Duration::from_secs(60),
+            timeout: Duration::from_secs(5),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
@@ -201,6 +276,14 @@ fn resolve_env(value: &str, lookup: impl FnOnce(&str) -> Option<String>) -> Resu
 mod tests {
     use super::*;
 
+    fn example_yaml() -> String {
+        EXAMPLE_CONFIG
+            .replace("${GS_AUTH}", "literal-rpc-token")
+            .replace("${IOTA_RPC_URL}", "http://localhost:9000")
+            .replace("${REDIS_URL}", "redis://localhost:6379")
+            .replace("${GAS_STATION_B_TOKEN}", "literal-backend-token")
+    }
+
     #[test]
     fn environment_values_remain_literal_and_are_not_expanded_recursively() {
         let secret = "quotes: \"value\"\n${OTHER}";
@@ -234,12 +317,9 @@ mod tests {
 
     #[test]
     fn invalid_duration_and_unknown_options_are_rejected() {
-        let yaml = EXAMPLE_CONFIG
-            .replace("${GS_AUTH}", "literal-rpc-token")
-            .replace("${IOTA_RPC_URL}", "http://localhost:9000")
-            .replace("${REDIS_URL}", "redis://localhost:6379")
-            .replace("${GAS_STATION_B_TOKEN}", "literal-backend-token");
+        let yaml = example_yaml();
         let config: Config = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(config.health_checks, HealthChecksConfig::default());
         assert_eq!(config.routing.reserve_gas.retries.max_retries, 2);
         assert_eq!(
             config.routing.reserve_gas.retries.backoff,
@@ -253,5 +333,58 @@ mod tests {
         assert!(
             serde_yaml_ng::from_str::<Config>(&yaml.replace("max_retries:", "max_retry:")).is_err()
         );
+        for (field, invalid) in [
+            ("timeout: 1500ms", "timeout: invalid"),
+            ("initial_cooldown: 15s", "initial_cooldown: invalid"),
+            ("max_cooldown: 60s", "max_cooldown: invalid"),
+            ("initial_cooldown: 15s", "cooldown: 15s"),
+            ("backoff: 2\n", "backoff: invalid\n"),
+            ("backoff: 2\n", "backoff: 1.5\n"),
+            ("backoff: 2\n", "backoff: -1\n"),
+            ("interval: 60s", "interval: invalid"),
+            ("unhealthy_threshold:", "unhealthy_threshhold:"),
+            ("failure_threshold:", "failure_threshhold:"),
+            ("interval: 60s", "unknown_interval: 60s"),
+        ] {
+            assert!(
+                serde_yaml_ng::from_str::<Config>(&yaml.replace(field, invalid)).is_err(),
+                "accepted invalid health-check option: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn health_checks_accept_overrides_and_default_when_section_is_absent() {
+        let yaml = example_yaml();
+        let config: Config = serde_yaml_ng::from_str(
+            &yaml
+                .replace("timeout: 1500ms", "timeout: 250ms")
+                .replace("failure_threshold: 3", "failure_threshold: 7")
+                .replace("initial_cooldown: 15s", "initial_cooldown: 4s")
+                .replace("backoff: 2\n", "backoff: 3\n")
+                .replace("max_cooldown: 60s", "max_cooldown: 40s")
+                .replace("interval: 60s", "interval: 90s"),
+        )
+        .unwrap();
+        assert_eq!(config.health_checks.timeout, Duration::from_millis(250));
+        assert_eq!(config.health_checks.passive.failure_threshold, 7);
+        assert_eq!(
+            config.health_checks.passive.initial_cooldown,
+            Duration::from_secs(4)
+        );
+        assert_eq!(config.health_checks.passive.backoff, 3);
+        assert_eq!(
+            config.health_checks.passive.max_cooldown,
+            Duration::from_secs(40)
+        );
+        assert_eq!(
+            config.health_checks.deep_check.interval,
+            Duration::from_secs(90)
+        );
+
+        let mut value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&yaml).unwrap();
+        value.as_mapping_mut().unwrap().remove("health_checks");
+        let config: Config = serde_yaml_ng::from_value(value).unwrap();
+        assert_eq!(config.health_checks, HealthChecksConfig::default());
     }
 }

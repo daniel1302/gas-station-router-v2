@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 use crate::{
     api,
-    backend::registry::BackendRegistry,
+    backend::{health::BackgroundHealthChecker, registry::BackendRegistry},
     config::{Config, RoutingAlgorithm, StorageKind},
     metrics,
     routing::round_robin::RoundRobinSelector,
@@ -23,7 +23,11 @@ pub async fn start(config: Config) -> Result<()> {
     };
     let timeout = config.routing.reserve_gas.timeout;
     let client = reservation::http_client(timeout)?;
-    let registry = Arc::new(BackendRegistry::new(&config.backends)?);
+    let registry = Arc::new(BackendRegistry::with_passive_health(
+        &config.backends,
+        config.health_checks.passive.clone(),
+    )?);
+    let health_checker = BackgroundHealthChecker::new(registry.clone(), config.health_checks)?;
     let selector = match config.routing.algorithm {
         RoutingAlgorithm::RoundRobin => Arc::new(RoundRobinSelector::new()),
     };
@@ -42,7 +46,6 @@ pub async fn start(config: Config) -> Result<()> {
     let metrics = TcpListener::bind(config.metrics.address())
         .await
         .context("failed to bind metrics listener")?;
-    registry.refresh_health(&client, timeout).await;
     tracing::info!(listener = "rpc", address = %rpc.local_addr()?, "HTTP server listening");
     tracing::info!(listener = "metrics", address = %metrics.local_addr()?, "HTTP server listening");
 
@@ -66,7 +69,16 @@ pub async fn start(config: Config) -> Result<()> {
         Ok::<_, anyhow::Error>(())
     };
 
-    let health = registry.monitor_health(client, timeout, shutdown_rx.clone());
+    // JoinSet aborts the background task if a server fails before graceful shutdown.
+    let mut health_tasks = JoinSet::new();
+    health_tasks.spawn(health_checker.run(shutdown_rx.clone()));
+    let health = async {
+        health_tasks
+            .join_next()
+            .await
+            .context("health-check task was not started")?
+            .context("background health-check task failed")?
+    };
     tokio::try_join!(rpc_server, metrics_server, health, shutdown)?;
     tracing::info!("Gas Station router stopped");
     Ok(())

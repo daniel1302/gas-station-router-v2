@@ -35,6 +35,26 @@ routing:
     reservation: 15m
     transaction_effects: 30m
 
+health_checks:
+  enabled: true
+  interval: 5s
+  timeout: 1500ms
+
+  unhealthy_threshold: 3
+  healthy_threshold: 2
+
+  passive:
+    enabled: true
+    failure_threshold: 3
+    initial_cooldown: 15s
+    backoff: 2
+    max_cooldown: 60s
+
+  deep_check:
+    enabled: false
+    interval: 60s
+    timeout: 5s
+
 backends:
   - name: gas_station_a
     enabled: true
