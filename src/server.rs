@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 use crate::{
@@ -11,7 +11,7 @@ use crate::{
     routing::round_robin::RoundRobinSelector,
     services::execution::ExecutionService,
     services::reservation::{self, ReservationService},
-    storage::{Storage, memory::MemoryStorage},
+    storage::{Storage, memory::MemoryStorage, redis::RedisStorage},
 };
 
 pub async fn start(config: Config) -> Result<()> {
@@ -19,7 +19,12 @@ pub async fn start(config: Config) -> Result<()> {
     let storage: Arc<dyn Storage> = match config.storage.kind {
         StorageKind::Memory => Arc::new(MemoryStorage::new()),
         StorageKind::Redis => {
-            bail!("Redis storage is not implemented yet; use storage.kind: memory")
+            let redis = config
+                .storage
+                .redis
+                .as_ref()
+                .context("storage.redis is required for Redis storage")?;
+            Arc::new(RedisStorage::new(&redis.url, &redis.key_prefix).await?)
         }
     };
     let timeout = config.routing.reserve_gas.timeout;

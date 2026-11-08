@@ -2,6 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::Client;
+use serde::Serialize;
 use tokio::{
     sync::watch,
     task::JoinSet,
@@ -14,7 +15,8 @@ use crate::{
     metrics,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BackendHealth {
     /// Backend is available for new reservations.
     Healthy,
@@ -250,6 +252,27 @@ struct Cooldown {
     duration: Duration,
 }
 
+#[derive(Serialize)]
+pub(super) struct HealthSnapshot {
+    pub health: BackendHealth,
+    active_success_count: u32,
+    active_failure_count: u32,
+    reservation_failure_count: u32,
+    cooldown: Option<CooldownSnapshot>,
+}
+
+#[derive(Serialize)]
+struct CooldownSnapshot {
+    active: bool,
+    duration_ms: u64,
+    remaining_ms: u64,
+    next_duration_ms: u64,
+}
+
+fn milliseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl HealthState {
     pub(super) fn new() -> Self {
         Self {
@@ -263,18 +286,50 @@ impl HealthState {
     }
 
     fn cooldown_active(&self) -> bool {
-        self.cooldown
-            .as_ref()
-            .is_some_and(|cooldown| cooldown.started.elapsed() < cooldown.duration)
+        !self.cooldown_remaining(Instant::now()).is_zero()
+    }
+
+    fn cooldown_remaining(&self, now: Instant) -> Duration {
+        self.cooldown.as_ref().map_or(Duration::ZERO, |cooldown| {
+            cooldown
+                .duration
+                .saturating_sub(now.saturating_duration_since(cooldown.started))
+        })
     }
 
     pub(super) fn status(&self) -> BackendHealth {
+        self.status_at(Instant::now())
+    }
+
+    fn status_at(&self, now: Instant) -> BackendHealth {
         if self.health == BackendHealth::Unhealthy {
             BackendHealth::Unhealthy
-        } else if self.cooldown_active() {
+        } else if !self.cooldown_remaining(now).is_zero() {
             BackendHealth::Degraded
         } else {
             BackendHealth::Healthy
+        }
+    }
+
+    pub(super) fn snapshot(&self, config: &PassiveHealthCheckConfig) -> HealthSnapshot {
+        let now = Instant::now();
+        let remaining = self.cooldown_remaining(now);
+        HealthSnapshot {
+            health: self.status_at(now),
+            active_success_count: self.success_count,
+            active_failure_count: self.failure_count,
+            reservation_failure_count: self.reservation_failure_count,
+            cooldown: self.cooldown.as_ref().map(|cooldown| CooldownSnapshot {
+                active: !remaining.is_zero(),
+                duration_ms: milliseconds(cooldown.duration),
+                remaining_ms: milliseconds(remaining),
+                next_duration_ms: milliseconds(
+                    cooldown
+                        .duration
+                        .saturating_mul(config.backoff)
+                        .min(config.max_cooldown),
+                ),
+            }),
         }
     }
 
@@ -299,8 +354,6 @@ impl HealthState {
         }
         self.last_logged_health = health;
         metrics::inc_backend_health_transition(backend, previous_health.label(), health.label());
-        let milliseconds =
-            |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         let cooldown_ms = self
             .cooldown
             .as_ref()

@@ -7,6 +7,7 @@ use std::{
 };
 
 use super::health::{BackendHealth, HealthCheckOutcome, HealthState, ReservationOutcome};
+use super::status::{BackendStatus, RegistryStatus};
 use crate::{
     config::{BackendConfig, PassiveHealthCheckConfig},
     metrics,
@@ -144,6 +145,15 @@ impl BackendRegistry {
         self.get(name).map(|backend| backend.health())
     }
 
+    pub(crate) fn status(&self) -> RegistryStatus {
+        RegistryStatus::new(
+            self.backends
+                .iter()
+                .map(|backend| backend.snapshot())
+                .collect(),
+        )
+    }
+
     pub(crate) fn get(&self, name: &str) -> Option<Arc<Backend>> {
         self.backends
             .iter()
@@ -160,6 +170,21 @@ impl BackendRegistry {
 }
 
 impl Backend {
+    fn snapshot(&self) -> BackendStatus {
+        let state = self
+            .health
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let health = state.snapshot(&self.passive);
+        BackendStatus {
+            name: self.name.clone(),
+            enabled: self.enabled,
+            eligible_for_reservations: self.enabled && health.health == BackendHealth::Healthy,
+            inflight_reservations: self.inflight.load(Ordering::Relaxed),
+            health,
+        }
+    }
+
     fn health(&self) -> BackendHealth {
         let mut state = self
             .health

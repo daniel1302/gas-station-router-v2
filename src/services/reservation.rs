@@ -119,6 +119,10 @@ pub fn http_client(timeout: Duration) -> Result<Client> {
 }
 
 impl ReservationService {
+    pub(crate) fn backend_registry(&self) -> Arc<BackendRegistry> {
+        self.registry.clone()
+    }
+
     pub fn new(
         registry: Arc<BackendRegistry>,
         selector: Arc<dyn BackendSelector>,
