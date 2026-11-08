@@ -23,7 +23,10 @@ pub async fn start(config: Config) -> Result<()> {
     };
     let timeout = config.routing.reserve_gas.timeout;
     let client = reservation::http_client(timeout)?;
-    let registry = Arc::new(BackendRegistry::new(&config.backends)?);
+    let registry = Arc::new(BackendRegistry::with_passive_health(
+        &config.backends,
+        config.health_checks.passive.clone(),
+    )?);
     let health_checker = BackgroundHealthChecker::new(registry.clone(), config.health_checks)?;
     let selector = match config.routing.algorithm {
         RoutingAlgorithm::RoundRobin => Arc::new(RoundRobinSelector::new()),

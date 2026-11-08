@@ -9,7 +9,7 @@ use axum::{
 use gas_station_router_v2::{
     api,
     backend::registry::BackendRegistry,
-    config::{BackendConfig, ReserveGasConfig, RetryConfig},
+    config::{BackendConfig, PassiveHealthCheckConfig, ReserveGasConfig, RetryConfig},
     metrics,
     routing::round_robin::RoundRobinSelector,
     services::reservation::{ReservationService, http_client},
@@ -290,6 +290,7 @@ async fn exports_static_events_and_scrapes_without_accessing_storage() {
         "storage_calls",
         "storage_health_checks",
         "backend_selector_calls",
+        "backend_authorization_errors",
         "reserve_gas_requests",
         "reserve_gas_errors",
     ] {
@@ -298,6 +299,17 @@ async fn exports_static_events_and_scrapes_without_accessing_storage() {
         )));
     }
     assert!(text.contains("# TYPE gas_station_router_backend_registry_candidates gauge\n"));
+    for status in ["401", "403"] {
+        assert_eq!(
+            sample(
+                &text,
+                &format!(
+                    "gas_station_router_backend_authorization_errors_total{{backend=\"b\",status=\"{status}\"}}"
+                )
+            ),
+            0
+        );
+    }
 
     let router = metrics::router();
     for _ in 0..2 {
@@ -348,7 +360,18 @@ async fn reservation_metrics() {
             rpc: upstream.uri(),
         },
     ];
-    let registry = Arc::new(BackendRegistry::new(&configs).unwrap());
+    // This scenario deliberately uses immediate passive exclusion to keep the
+    // selector/HTTP counter assertions independent of the default threshold.
+    let registry = Arc::new(
+        BackendRegistry::with_passive_health(
+            &configs,
+            PassiveHealthCheckConfig {
+                failure_threshold: 1,
+                ..PassiveHealthCheckConfig::default()
+            },
+        )
+        .unwrap(),
+    );
     let client = http_client(Duration::from_secs(1)).unwrap();
     let service = ReservationService::new(
         registry.clone(),

@@ -258,7 +258,7 @@ async fn retries_connect_error_on_b_without_skipping_to_c() {
     assert_eq!(mapping.backend, "b");
     assert_eq!(mapping.upstream_reservation_id, 200);
     assert!(
-        !registry
+        registry
             .candidates(&HashSet::new())
             .iter()
             .any(|candidate| candidate.name == "a")
@@ -357,8 +357,13 @@ async fn explicit_reservation_rejections_fail_over_and_store_only_the_success() 
             .unwrap();
         assert_eq!(mapping.backend, "b");
         assert_eq!(mapping.upstream_reservation_id, 20);
-        // A rejection only excludes the backend from this request.
-        assert_eq!(registry.candidates(&HashSet::new()).len(), 2);
+        // Capacity rejection additionally excludes the backend during cooldown.
+        let expected = if error == "Unable to reserve gas coins for the given budget." {
+            1
+        } else {
+            2
+        };
+        assert_eq!(registry.candidates(&HashSet::new()).len(), expected);
     }
 }
 
@@ -583,6 +588,41 @@ async fn redirects_are_not_followed() {
         send(router, request(), None).await.0,
         StatusCode::BAD_GATEWAY
     );
+}
+
+#[tokio::test]
+async fn upstream_success_resets_passive_failures_even_if_mapping_storage_fails() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .respond_with(move |_: &wiremock::Request| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                ResponseTemplate::new(200).set_body_json(success(42))
+            } else {
+                ResponseTemplate::new(500)
+                    .set_body_json(json!({"result": null, "error": "Redis unavailable"}))
+            }
+        })
+        .expect(4)
+        .mount(&server)
+        .await;
+    let storage = Arc::new(UnavailableStorage::default());
+    let (router, registry) = app(
+        vec![backend("a", server.uri())],
+        storage.clone(),
+        settings(0, Duration::from_secs(1)),
+        "",
+    );
+    for expected in [
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
+        assert_eq!(send(router.clone(), request(), None).await.0, expected);
+        assert_eq!(registry.candidates(&HashSet::new()).len(), 1);
+    }
+    assert_eq!(storage.writes.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

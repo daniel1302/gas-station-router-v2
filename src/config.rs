@@ -181,7 +181,7 @@ impl Default for HealthChecksConfig {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PassiveHealthCheckConfig {
     pub enabled: bool,

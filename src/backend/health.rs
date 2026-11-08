@@ -1,15 +1,15 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{Client, StatusCode};
 use tokio::{
     sync::watch,
     task::JoinSet,
-    time::{MissedTickBehavior, interval},
+    time::{Instant, MissedTickBehavior, interval},
 };
 
 use super::registry::{Backend, BackendRegistry};
-use crate::config::HealthChecksConfig;
+use crate::config::{HealthChecksConfig, PassiveHealthCheckConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendHealth {
@@ -22,6 +22,16 @@ pub enum BackendHealth {
 
     /// Backend is unreachable or repeatedly failing.
     Unhealthy,
+}
+
+/// Reservation health observations are independent of whether retrying is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservationOutcome {
+    Success,
+    BackendFailure,
+    NoGasCoins,
+    AuthorizationFailure(u16),
+    Neutral,
 }
 
 /// ```text
@@ -164,26 +174,43 @@ async fn probe(
 
 /// Updated under the backend's mutex, including explicit health changes from reservations.
 pub(super) struct HealthState {
-    healthy: bool,
+    health: BackendHealth,
     success_count: u32,
     failure_count: u32,
+    reservation_failure_count: u32,
+    cooldown_started: Option<Instant>,
 }
 
 impl HealthState {
     pub(super) fn new() -> Self {
         Self {
-            healthy: true,
+            health: BackendHealth::Healthy,
             success_count: 0,
             failure_count: 0,
+            reservation_failure_count: 0,
+            cooldown_started: None,
         }
     }
 
-    pub(super) fn is_healthy(&self) -> bool {
-        self.healthy
+    pub(super) fn status(&self, cooldown: Duration) -> BackendHealth {
+        if self.health == BackendHealth::Unhealthy {
+            BackendHealth::Unhealthy
+        } else if self
+            .cooldown_started
+            .is_some_and(|start| start.elapsed() < cooldown)
+        {
+            BackendHealth::Degraded
+        } else {
+            BackendHealth::Healthy
+        }
     }
 
     pub(super) fn set_healthy(&mut self, healthy: bool) {
-        self.healthy = healthy;
+        self.health = if healthy {
+            BackendHealth::Healthy
+        } else {
+            BackendHealth::Unhealthy
+        };
         self.success_count = 0;
         self.failure_count = 0;
     }
@@ -193,21 +220,54 @@ impl HealthState {
         success: bool,
         healthy_threshold: u32,
         unhealthy_threshold: u32,
-    ) -> Option<bool> {
-        let previous = self.healthy;
+        cooldown: Duration,
+    ) -> Option<BackendHealth> {
+        let previous = self.status(cooldown);
         if success {
             self.failure_count = 0;
             self.success_count = self.success_count.saturating_add(1);
             if self.success_count >= healthy_threshold {
-                self.healthy = true;
+                self.health = BackendHealth::Healthy;
             }
         } else {
             self.success_count = 0;
             self.failure_count = self.failure_count.saturating_add(1);
             if self.failure_count >= unhealthy_threshold {
-                self.healthy = false;
+                self.health = BackendHealth::Unhealthy;
             }
         }
-        (self.healthy != previous).then_some(self.healthy)
+        let current = self.status(cooldown);
+        (current != previous).then_some(current)
+    }
+
+    pub(super) fn record_reservation(
+        &mut self,
+        outcome: ReservationOutcome,
+        config: &PassiveHealthCheckConfig,
+    ) -> Option<BackendHealth> {
+        if !config.enabled {
+            return None;
+        }
+        let previous = self.status(config.cooldown);
+        match outcome {
+            ReservationOutcome::Success => {
+                // An already in-flight success must not undo a newer cooldown
+                // or bypass the background checker's recovery threshold.
+                self.reservation_failure_count = 0;
+            }
+            ReservationOutcome::BackendFailure => {
+                self.reservation_failure_count = self.reservation_failure_count.saturating_add(1);
+                if self.reservation_failure_count >= config.failure_threshold {
+                    self.health = BackendHealth::Unhealthy;
+                    self.success_count = 0;
+                }
+            }
+            ReservationOutcome::NoGasCoins => {
+                self.cooldown_started = Some(Instant::now());
+            }
+            ReservationOutcome::AuthorizationFailure(_) | ReservationOutcome::Neutral => {}
+        }
+        let current = self.status(config.cooldown);
+        (current != previous).then_some(current)
     }
 }

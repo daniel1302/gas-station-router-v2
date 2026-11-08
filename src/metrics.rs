@@ -27,6 +27,7 @@ struct Metrics {
     candidates: IntGauge,
     reserve_requests: IntCounter,
     reserve_errors: IntCounter,
+    backend_authorization_errors: IntCounterVec,
 }
 
 impl Metrics {
@@ -81,6 +82,12 @@ impl Metrics {
                 "Number of candidates returned by the latest registry call, after exclusions.",
             )
             .expect("static gauge definition is valid"),
+        );
+        let backend_authorization_errors = counter_vec(
+            &registry,
+            "backend_authorization_errors_total",
+            "Backend reserve_gas responses with HTTP 401 or 403; check backend authorization configuration.",
+            &["backend", "status"],
         );
         let reserve_requests = register(
             &registry,
@@ -152,6 +159,7 @@ impl Metrics {
             candidates,
             reserve_requests,
             reserve_errors,
+            backend_authorization_errors,
         }
     }
 }
@@ -223,6 +231,26 @@ pub fn inc_reserve_gas() {
 
 pub fn inc_reserve_gas_error() {
     METRICS.reserve_errors.inc();
+}
+
+pub(crate) fn init_backend_authorization_errors(backend: &str) {
+    for status in ["401", "403"] {
+        METRICS
+            .backend_authorization_errors
+            .with_label_values(&[backend, status]);
+    }
+}
+
+pub fn inc_backend_authorization_error(backend: &str, status: u16) {
+    let status = match status {
+        401 => "401",
+        403 => "403",
+        _ => return,
+    };
+    METRICS
+        .backend_authorization_errors
+        .with_label_values(&[backend, status])
+        .inc();
 }
 
 pub fn render() -> Result<String, prometheus::Error> {
