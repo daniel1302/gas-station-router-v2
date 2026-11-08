@@ -7,6 +7,7 @@ metrics:
   host: 127.0.0.1
   port: 9184
 iota:
+  # Gas Stations' fullnode, used for execution recovery and local confirmation.
   rpc_url: ${IOTA_RPC_URL}
   timeout: 10s
 storage:
@@ -56,3 +57,6 @@ backends:
   - name: gas_station_3
     token: ${GS_AUTH}
     rpc: http://127.0.0.1:9529
+  - name: gas_station_4
+    token: ${GS_AUTH}
+    rpc: http://127.0.0.1:9530

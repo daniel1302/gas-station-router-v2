@@ -26,12 +26,14 @@ pub(super) async fn reserve_gas(
             .and_then(|value| value.strip_prefix("Bearer "))
             != Some(state.token.as_str())
     {
+        tracing::warn!(reason = "unauthorized", "Reservation request rejected");
         return reserve_response(ReserveReply::error(
             StatusCode::UNAUTHORIZED,
             "invalid or missing authorization token",
         ));
     }
     let Ok(Json(request)) = request else {
+        tracing::warn!(reason = "invalid_request", "Reservation request rejected");
         return reserve_response(ReserveReply::error(
             StatusCode::BAD_REQUEST,
             "invalid reserve_gas request",
@@ -48,6 +50,8 @@ fn reserve_response(reply: ReserveReply) -> Response {
             .is_some_and(|error| !error.is_null())
     {
         metrics::inc_reserve_gas_error();
+    } else {
+        metrics::inc_reserve_gas_success();
     }
     (reply.status, Json(reply.body)).into_response()
 }

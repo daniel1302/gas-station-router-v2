@@ -27,7 +27,15 @@ struct Metrics {
     candidates: IntGauge,
     reserve_requests: IntCounter,
     reserve_errors: IntCounter,
+    reserve_successes: IntCounter,
     backend_authorization_errors: IntCounterVec,
+    health_transitions: IntCounterVec,
+    health_check_failures: IntCounterVec,
+    reserve_attempt_failures: IntCounterVec,
+    reserve_retries: IntCounterVec,
+    execution_errors: IntCounterVec,
+    execution_successes: IntCounter,
+    recovery_retries: IntCounterVec,
 }
 
 impl Metrics {
@@ -89,6 +97,50 @@ impl Metrics {
             "Backend reserve_gas responses with HTTP 401 or 403; check backend authorization configuration.",
             &["backend", "status"],
         );
+        let health_transitions = counter_vec(
+            &registry,
+            "backend_health_transitions_total",
+            "Effective backend health changes, including passive checks and cooldown expiry.",
+            &["backend", "previous_health", "health"],
+        );
+        let health_check_failures = counter_vec(
+            &registry,
+            "backend_health_check_failures_total",
+            "Failed active health probes, including failures below the unhealthy threshold.",
+            &["backend", "reason"],
+        );
+        let reserve_attempt_failures = counter_vec(
+            &registry,
+            "reserve_gas_attempt_failures_total",
+            "Failed upstream reservation attempts, including business rejections.",
+            &["backend", "reason"],
+        );
+        let reserve_retries = counter_vec(
+            &registry,
+            "reserve_gas_retries_total",
+            "Additional reservation attempts started, labeled by the backend and failure that caused the retry.",
+            &["backend", "reason"],
+        );
+        let execution_errors = counter_vec(
+            &registry,
+            "execute_tx_errors_total",
+            "Failed execute_tx calls, once per final result, including validation and finalized transaction failures.",
+            &["reason"],
+        );
+        let execution_successes = register(
+            &registry,
+            IntCounter::new(
+                "gas_station_router_execute_tx_successes_total",
+                "Successful execute_tx results, once per call, including recovery and cache reads; finalized transaction failures are excluded.",
+            )
+            .expect("static counter definition is valid"),
+        );
+        let recovery_retries = counter_vec(
+            &registry,
+            "execute_tx_recovery_retries_total",
+            "Additional RPC lookup rounds started after an inconclusive recovery or local execution check; never transaction resubmissions.",
+            &["backend", "stage"],
+        );
         let reserve_requests = register(
             &registry,
             IntCounter::new(
@@ -102,6 +154,14 @@ impl Metrics {
             IntCounter::new(
                 "gas_station_router_reserve_gas_errors_total",
                 "reserve_gas calls returning an HTTP or business error, counted once per final response.",
+            )
+            .expect("static counter definition is valid"),
+        );
+        let reserve_successes = register(
+            &registry,
+            IntCounter::new(
+                "gas_station_router_reserve_gas_successes_total",
+                "Successful reserve_gas responses after storing the reservation mapping, once per call; retries are not additional successes.",
             )
             .expect("static counter definition is valid"),
         );
@@ -137,6 +197,7 @@ impl Metrics {
             "get_transaction",
             "try_claim_execution",
             "get_execution",
+            "try_claim_recovery",
             "mark_execution_dispatching",
             "complete_execution",
             "cancel_execution",
@@ -146,6 +207,25 @@ impl Metrics {
         }
         for kind in ["healthy", "unhealthy"] {
             storage_health.with_label_values(&[kind]);
+        }
+        for reason in [
+            "unauthorized",
+            "invalid_request",
+            "invalid_transaction",
+            "invalid_signature",
+            "reservation_not_found",
+            "backend_not_configured",
+            "digest_conflict",
+            "storage_conflict",
+            "storage_unavailable",
+            "invalid_backend_request",
+            "backend_metadata_missing",
+            "rpc_effects_conflict",
+            "timeout",
+            "task_failed",
+            "transaction_failed",
+        ] {
+            execution_errors.with_label_values(&[reason]);
         }
         Self {
             registry,
@@ -159,7 +239,15 @@ impl Metrics {
             candidates,
             reserve_requests,
             reserve_errors,
+            reserve_successes,
             backend_authorization_errors,
+            health_transitions,
+            health_check_failures,
+            reserve_attempt_failures,
+            reserve_retries,
+            execution_errors,
+            execution_successes,
+            recovery_retries,
         }
     }
 }
@@ -233,12 +321,113 @@ pub fn inc_reserve_gas_error() {
     METRICS.reserve_errors.inc();
 }
 
-pub(crate) fn init_backend_authorization_errors(backend: &str) {
+pub(crate) fn inc_reserve_gas_success() {
+    METRICS.reserve_successes.inc();
+}
+
+pub(crate) fn init_backend_metrics(backend: &str) {
+    for stage in ["recovery", "local_execution"] {
+        METRICS
+            .recovery_retries
+            .with_label_values(&[backend, stage]);
+    }
     for status in ["401", "403"] {
         METRICS
             .backend_authorization_errors
             .with_label_values(&[backend, status]);
     }
+    for previous in ["healthy", "degraded", "unhealthy"] {
+        for health in ["healthy", "degraded", "unhealthy"] {
+            if previous != health {
+                METRICS
+                    .health_transitions
+                    .with_label_values(&[backend, previous, health]);
+            }
+        }
+    }
+    for reason in [
+        "http_error",
+        "connection_refused",
+        "connection_timeout",
+        "request_timeout",
+        "connection_error",
+        "transport_error",
+    ] {
+        METRICS
+            .health_check_failures
+            .with_label_values(&[backend, reason]);
+    }
+    for reason in [
+        "connection_refused",
+        "connection_timeout",
+        "request_timeout",
+        "connection_error",
+        "transport_error",
+        "invalid_response",
+        "redirect",
+        "http_error",
+        "authorization_error",
+        "invalid_request",
+        "rate_limited",
+        "no_gas_coins",
+        "maintenance",
+        "daily_cap",
+        "business_rejection",
+    ] {
+        METRICS
+            .reserve_attempt_failures
+            .with_label_values(&[backend, reason]);
+        METRICS
+            .reserve_retries
+            .with_label_values(&[backend, reason]);
+    }
+}
+
+pub(crate) fn inc_backend_health_transition(
+    backend: &str,
+    previous_health: &'static str,
+    health: &'static str,
+) {
+    METRICS
+        .health_transitions
+        .with_label_values(&[backend, previous_health, health])
+        .inc();
+}
+
+pub(crate) fn inc_backend_health_check_failure(backend: &str, reason: &'static str) {
+    METRICS
+        .health_check_failures
+        .with_label_values(&[backend, reason])
+        .inc();
+}
+
+pub(crate) fn inc_reserve_gas_attempt_failure(backend: &str, reason: &'static str) {
+    METRICS
+        .reserve_attempt_failures
+        .with_label_values(&[backend, reason])
+        .inc();
+}
+
+pub(crate) fn inc_reserve_gas_retry(backend: &str, reason: &'static str) {
+    METRICS
+        .reserve_retries
+        .with_label_values(&[backend, reason])
+        .inc();
+}
+
+pub(crate) fn inc_execute_tx_error(reason: &'static str) {
+    METRICS.execution_errors.with_label_values(&[reason]).inc();
+}
+
+pub(crate) fn inc_execute_tx_success() {
+    METRICS.execution_successes.inc();
+}
+
+pub(crate) fn inc_execute_tx_recovery_retry(backend: &str, stage: &'static str) {
+    METRICS
+        .recovery_retries
+        .with_label_values(&[backend, stage])
+        .inc();
 }
 
 pub fn inc_backend_authorization_error(backend: &str, status: u16) {

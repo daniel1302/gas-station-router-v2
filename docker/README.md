@@ -45,14 +45,14 @@ Optional:
 ```sh
 ROUTER_URL=http://127.0.0.1:9257 ./e2e.sh reserve --count 20
 ./e2e.sh reserve --count 3 --min-sponsors 1   # test a single backend
-./e2e.sh transactions --count 9             # full transactions, for later use
+./e2e.sh transactions --count 9             # submit and verify full transactions
 ```
 
-**Currently, `transactions` fails with `501 not implemented` before reserving gas**,
-because the router does not execute transactions yet. Once execution is implemented,
-this mode will submit signed transactions with random senders and budgets through
-`/v1/execute_transaction`. Each transaction reads the IOTA clock 1–5 times, and its
-result is verified independently on the fullnode.
+`transactions` submits signed transactions with random senders and budgets through
+`/v1/execute_transaction` (an alias of `/v1/execute_tx`). Each transaction reads the
+IOTA clock 1–5 times, and its result is verified independently on the fullnode.
+If execution times out, retry the same reservation and transaction to recover its
+result. The router never resubmits an execution whose outcome is unknown.
 
 Default `ROUTER_URL`: `http://127.0.0.1:9257`. `.env` provides `GS_AUTH`,
 `IOTA_RPC_URL=https://api.testnet.iota.cafe` and

@@ -34,6 +34,8 @@ use wiremock::{
     matchers::{body_json, header, method, path},
 };
 
+mod common;
+
 fn backend(name: &str, rpc: String) -> BackendConfig {
     BackendConfig {
         name: name.into(),
@@ -75,6 +77,7 @@ fn app(
         registry.set_healthy(&backend.name, true);
     }
     let client = http_client(config.timeout).unwrap();
+    let execution = common::execution(registry.clone(), storage.clone());
     let service = ReservationService::new(
         registry.clone(),
         Arc::new(RoundRobinSelector::new()),
@@ -84,7 +87,10 @@ fn app(
         Duration::from_secs(900),
     )
     .unwrap();
-    (api::router(Arc::new(service), token.into()), registry)
+    (
+        api::router(Arc::new(service), execution, token.into()),
+        registry,
+    )
 }
 
 async fn send(app: Router, body: Value, token: Option<&str>) -> (StatusCode, Value) {
@@ -822,6 +828,15 @@ fn unavailable<T>() -> StorageResult<T> {
 
 #[async_trait]
 impl Storage for UnavailableStorage {
+    async fn try_claim_recovery(
+        &self,
+        _: ReservationId,
+        _: &TransactionDigest,
+        _: ExecutionToken,
+        _: Duration,
+    ) -> StorageResult<ExecutionClaim> {
+        unavailable()
+    }
     async fn create_reservation(
         &self,
         _: Reservation,

@@ -12,6 +12,113 @@ use uuid::Uuid;
 const TTL: Duration = Duration::from_secs(10);
 const LEASE: Duration = Duration::from_secs(3);
 
+#[tokio::test(start_paused = true)]
+async fn recovery_leases_fence_previous_owners_and_preserve_phase_and_record_ttl() {
+    let store = MemoryStorage::new();
+    let id = store
+        .create_reservation(reservation(77), TTL)
+        .await
+        .unwrap();
+    let first = Uuid::new_v4();
+    claim(&store, id, first).await;
+    assert_eq!(
+        store
+            .try_claim_recovery(id, &digest(), Uuid::new_v4(), LEASE)
+            .await
+            .unwrap(),
+        ExecutionClaim::InFlight
+    );
+    store.mark_execution_dispatching(id, first).await.unwrap();
+    assert_eq!(
+        store
+            .try_claim_recovery(id, &TransactionDigest::new([1; 32]), Uuid::new_v4(), LEASE)
+            .await
+            .unwrap(),
+        ExecutionClaim::Conflict
+    );
+    advance(LEASE).await;
+    let second = Uuid::new_v4();
+    assert_eq!(
+        store
+            .try_claim_recovery(id, &digest(), second, LEASE)
+            .await
+            .unwrap(),
+        ExecutionClaim::Acquired
+    );
+    assert!(
+        store
+            .complete_execution(id, first, transaction(false), TTL)
+            .await
+            .is_err()
+    );
+    assert!(store.mark_execution_dispatching(id, second).await.is_err());
+    advance(LEASE).await;
+    let third = Uuid::new_v4();
+    assert_eq!(
+        store
+            .try_claim_recovery(id, &digest(), third, LEASE)
+            .await
+            .unwrap(),
+        ExecutionClaim::Acquired
+    );
+    assert!(
+        store
+            .complete_execution(id, second, transaction(false), TTL)
+            .await
+            .is_err()
+    );
+    let record = store.get_execution(id).await.unwrap().unwrap();
+    assert_eq!(record.phase, ExecutionPhase::Dispatching);
+    assert_eq!(record.backend.as_deref(), Some("station-a"));
+    store
+        .complete_execution(id, third, transaction(false), TTL)
+        .await
+        .unwrap();
+    advance(Duration::from_secs(4)).await;
+    assert!(store.get_execution(id).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .try_claim_recovery(id, &digest(), Uuid::new_v4(), LEASE)
+            .await
+            .unwrap(),
+        ExecutionClaim::Conflict
+    );
+    assert!(store.get_execution(id).await.unwrap().is_none());
+    assert!(store.get_transaction(&digest()).await.unwrap().is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn concurrent_recovery_claims_have_exactly_one_owner() {
+    let store = Arc::new(MemoryStorage::new());
+    let owner = Uuid::new_v4();
+    claim(&store, 123, owner).await;
+    store.mark_execution_dispatching(123, owner).await.unwrap();
+    advance(LEASE).await;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        let store = store.clone();
+        tasks.spawn(async move {
+            store
+                .try_claim_recovery(123, &digest(), Uuid::new_v4(), LEASE)
+                .await
+                .unwrap()
+        });
+    }
+    let mut acquired = 0;
+    while let Some(result) = tasks.join_next().await {
+        match result.unwrap() {
+            ExecutionClaim::Acquired => acquired += 1,
+            ExecutionClaim::InFlight => {}
+            result => panic!("unexpected recovery claim {result:?}"),
+        }
+    }
+    assert_eq!(acquired, 1);
+    assert_eq!(
+        store.get_execution(123).await.unwrap().unwrap().phase,
+        ExecutionPhase::Dispatching
+    );
+}
+
 fn digest() -> TransactionDigest {
     TransactionDigest::new([42; 32])
 }

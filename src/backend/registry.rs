@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use super::health::{BackendHealth, HealthState, ReservationOutcome};
+use super::health::{BackendHealth, HealthCheckOutcome, HealthState, ReservationOutcome};
 use crate::{
     config::{BackendConfig, PassiveHealthCheckConfig},
     metrics,
@@ -91,7 +91,7 @@ impl BackendRegistry {
                 value.set_sensitive(true);
                 Some(value)
             };
-            metrics::init_backend_authorization_errors(&config.name);
+            metrics::init_backend_metrics(&config.name);
             backends.push(Arc::new(Backend {
                 name: config.name.clone(),
                 url,
@@ -127,11 +127,13 @@ impl BackendRegistry {
     /// Allows health monitoring to update a backend without changing routing policy.
     pub fn set_healthy(&self, name: &str, healthy: bool) -> bool {
         if let Some(backend) = self.get(name) {
-            backend
+            let mut state = backend
                 .health
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .set_healthy(healthy);
+                .unwrap_or_else(|error| error.into_inner());
+            state.log_cooldown_expiry(&backend.name);
+            state.set_healthy(healthy);
+            state.log_transition(&backend.name, "manual", "manual_override", None, None);
             true
         } else {
             false
@@ -159,10 +161,12 @@ impl BackendRegistry {
 
 impl Backend {
     fn health(&self) -> BackendHealth {
-        self.health
+        let mut state = self
+            .health
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .status()
+            .unwrap_or_else(|error| error.into_inner());
+        state.log_cooldown_expiry(&self.name);
+        state.status()
     }
 
     /// Passive health checks based on the outcome of `reserve_gas`.
@@ -186,14 +190,24 @@ impl Backend {
             tracing::error!(backend = %self.name, status, alert = "backend_reservation_authorization",
                 "Backend reserve_gas authorization failed; check the configured backend token");
         }
-        let transition = self
+        let mut state = self
             .health
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .record_reservation(outcome, &self.passive);
-        if let Some(health) = transition {
-            tracing::warn!(backend = %self.name, ?health, ?outcome, "Backend passive health changed");
-        }
+            .unwrap_or_else(|error| error.into_inner());
+        state.log_cooldown_expiry(&self.name);
+        state.record_reservation(outcome, &self.passive);
+        let (reason, http_status) = match outcome {
+            ReservationOutcome::Success => ("reservation_success", None),
+            ReservationOutcome::BackendFailure(cause) => cause.log_fields(),
+            ReservationOutcome::NoGasCoins => ("no_gas_coins", None),
+            ReservationOutcome::AuthorizationFailure(status) => {
+                ("authorization_failure", Some(status))
+            }
+            ReservationOutcome::Neutral => ("neutral_response", None),
+        };
+        let threshold = matches!(outcome, ReservationOutcome::BackendFailure(_))
+            .then_some(self.passive.failure_threshold);
+        state.log_transition(&self.name, "passive", reason, http_status, threshold);
     }
 
     pub(super) fn health_request(&self, client: &Client) -> RequestBuilder {
@@ -202,18 +216,41 @@ impl Backend {
 
     pub(super) fn record_health_result(
         &self,
-        success: bool,
+        outcome: HealthCheckOutcome,
         healthy_threshold: u32,
         unhealthy_threshold: u32,
     ) {
-        let transition = self
+        let mut state = self
             .health
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .record(success, healthy_threshold, unhealthy_threshold);
-        if let Some(health) = transition {
-            tracing::info!(backend = %self.name, ?health, "Backend health changed");
+            .unwrap_or_else(|error| error.into_inner());
+        state.log_cooldown_expiry(&self.name);
+        let success = outcome == HealthCheckOutcome::HttpStatus(200);
+        state.record(success, healthy_threshold, unhealthy_threshold);
+        let (reason, http_status) = outcome.log_fields();
+        if !success {
+            metrics::inc_backend_health_check_failure(&self.name, reason);
+            tracing::warn!(
+                backend = %self.name,
+                reason,
+                http_status,
+                active_failure_count = state.active_failure_count(),
+                threshold = unhealthy_threshold,
+                "Backend health check failed"
+            );
         }
+        let threshold = if success {
+            healthy_threshold
+        } else {
+            unhealthy_threshold
+        };
+        state.log_transition(
+            &self.name,
+            "background",
+            reason,
+            http_status,
+            Some(threshold),
+        );
     }
 
     fn authorize(&self, request: RequestBuilder) -> RequestBuilder {
@@ -226,6 +263,12 @@ impl Backend {
     pub fn reserve_request(&self, client: &Client) -> RequestBuilder {
         let mut url = self.url.clone();
         url.set_path(&format!("{}v1/reserve_gas", self.url.path()));
+        self.authorize(client.post(url))
+    }
+
+    pub(crate) fn execute_request(&self, client: &Client) -> RequestBuilder {
+        let mut url = self.url.clone();
+        url.set_path(&format!("{}v1/execute_tx", self.url.path()));
         self.authorize(client.post(url))
     }
 

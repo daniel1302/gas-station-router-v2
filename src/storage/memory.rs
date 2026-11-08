@@ -156,6 +156,10 @@ impl Storage for MemoryStorage {
         let mut state = self.state.lock().await;
         let now = Instant::now();
         state.purge_expired(now);
+        let backend = state
+            .reservations
+            .get(&reservation_id)
+            .map(|entry| entry.value.backend.clone());
         match state.executions.entry(reservation_id) {
             Entry::Vacant(entry) => {
                 entry.insert(Expiring::new(
@@ -163,6 +167,7 @@ impl Storage for MemoryStorage {
                         record: ExecutionRecord {
                             digest: *digest,
                             phase: ExecutionPhase::Claimed,
+                            backend,
                         },
                         token,
                         lease_started_at: now,
@@ -237,6 +242,43 @@ impl Storage for MemoryStorage {
         Ok(())
     }
 
+    async fn try_claim_recovery(
+        &self,
+        reservation_id: ReservationId,
+        digest: &TransactionDigest,
+        token: ExecutionToken,
+        lease_ttl: Duration,
+    ) -> StorageResult<ExecutionClaim> {
+        metrics::inc_storage_call("try_claim_recovery");
+        validate_ttl(lease_ttl)?;
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        let Some(entry) = live_entry(&mut state.executions, &reservation_id, now) else {
+            return claim_result(ExecutionClaim::Conflict);
+        };
+        let execution = &mut entry.value;
+        if execution.record.digest != *digest {
+            return claim_result(ExecutionClaim::Conflict);
+        }
+        if execution.record.phase == ExecutionPhase::Claimed {
+            return claim_result(ExecutionClaim::InFlight);
+        }
+        if execution.lease_valid(now) {
+            return claim_result(if execution.token == token {
+                ExecutionClaim::Acquired
+            } else {
+                ExecutionClaim::InFlight
+            });
+        }
+        if execution.token == token {
+            return Err(conflict());
+        }
+        execution.token = token;
+        execution.lease_started_at = now;
+        execution.lease_ttl = lease_ttl;
+        claim_result(ExecutionClaim::Acquired)
+    }
+
     async fn complete_execution(
         &self,
         reservation_id: ReservationId,
@@ -272,6 +314,9 @@ impl Storage for MemoryStorage {
             execution.record.phase = ExecutionPhase::Completed;
             metrics::inc_storage_execution_phase("completed");
         }
+        // Completion releases the lease. A missing/expired effects cache can
+        // immediately be recovered with a fresh token, without another POST.
+        execution.lease_ttl = Duration::ZERO;
         Ok(outcome)
     }
 

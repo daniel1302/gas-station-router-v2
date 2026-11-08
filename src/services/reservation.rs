@@ -10,10 +10,11 @@ use tokio::time::sleep;
 
 use crate::{
     backend::{
-        health::ReservationOutcome,
+        health::{HealthCheckOutcome, ReservationOutcome},
         registry::{Backend, BackendRegistry},
     },
     config::ReserveGasConfig,
+    metrics,
     routing::BackendSelector,
     storage::{Reservation, Storage},
 };
@@ -75,6 +76,8 @@ struct ReserveFailure {
     kind: ReserveError,
     reply: ReserveReply,
     outcome: ReservationOutcome,
+    reason: &'static str,
+    http_status: Option<u16>,
 }
 
 struct UpstreamReservation {
@@ -144,6 +147,7 @@ impl ReservationService {
 
     pub async fn reserve_with_retry(&self, request: &ReserveGasRequest) -> ReserveReply {
         if request.gas_budget == 0 || request.reserve_duration_secs == 0 {
+            tracing::warn!(reason = "invalid_request", "Reservation request rejected");
             return ReserveReply::error(
                 StatusCode::BAD_REQUEST,
                 "gas_budget and reserve_duration_secs must be greater than zero",
@@ -151,6 +155,7 @@ impl ReservationService {
         }
         let mut excluded = HashSet::new();
         let mut last_failure = None;
+        let mut pending_retry: Option<(String, &'static str)> = None;
         for attempt in 0..=self.config.retries.max_retries {
             let candidates = self.registry.candidates(&excluded);
             let Some(candidate) = self
@@ -158,6 +163,11 @@ impl ReservationService {
                 .select(&candidates)
                 .and_then(|index| candidates.get(index))
             else {
+                tracing::warn!(
+                    reason = "no_eligible_backend",
+                    attempts = attempt,
+                    "Reservation stopped: no eligible backend"
+                );
                 return last_failure.unwrap_or_else(|| {
                     ReserveReply::error(
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -166,6 +176,8 @@ impl ReservationService {
                 });
             };
             let Some(backend) = self.registry.get(&candidate.name) else {
+                tracing::warn!(backend = %candidate.name, reason = "backend_unavailable",
+                    "Selected reservation backend is unavailable");
                 return ReserveReply::error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "selected backend is unavailable",
@@ -174,14 +186,39 @@ impl ReservationService {
             if attempt > 0 {
                 sleep(self.config.retries.backoff).await;
             }
+            if let Some((previous_backend, reason)) = pending_retry.take() {
+                metrics::inc_reserve_gas_retry(&previous_backend, reason);
+                tracing::warn!(
+                    backend = %previous_backend,
+                    retry_backend = %backend.name,
+                    reason,
+                    attempt = u64::from(attempt) + 1,
+                    "Retrying reservation on another backend"
+                );
+            }
             let mut reserved = match self.reserve_once(&backend, request).await {
                 Ok(reserved) => reserved,
                 Err(failure) => {
+                    metrics::inc_reserve_gas_attempt_failure(&backend.name, failure.reason);
+                    let retry_allowed =
+                        failure.kind.is_retryable() && attempt < self.config.retries.max_retries;
+                    tracing::warn!(
+                        backend = %backend.name,
+                        reason = failure.reason,
+                        http_status = failure.http_status,
+                        response_status = failure.reply.status.as_u16(),
+                        attempt = u64::from(attempt) + 1,
+                        max_retries = self.config.retries.max_retries,
+                        failure_kind = ?failure.kind,
+                        retry_allowed,
+                        "Backend reservation attempt failed"
+                    );
                     backend.record_reservation_outcome(failure.outcome);
-                    if !failure.kind.is_retryable() || attempt == self.config.retries.max_retries {
+                    if !retry_allowed {
                         return failure.reply;
                     }
                     excluded.insert(backend.name.clone());
+                    pending_retry = Some((backend.name.clone(), failure.reason));
                     last_failure = Some(failure.reply);
                     continue;
                 }
@@ -200,6 +237,8 @@ impl ReservationService {
             {
                 Ok(id) => id,
                 Err(_) => {
+                    tracing::warn!(backend = %backend.name, reason = "storage_unavailable",
+                        "Failed to store reservation mapping after backend success");
                     return ReserveReply::error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "failed to store reservation mapping",
@@ -229,6 +268,8 @@ impl ReservationService {
         let status = response.status();
         if status.is_redirection() {
             return Err(ReserveFailure {
+                reason: "redirect",
+                http_status: Some(status.as_u16()),
                 kind: ReserveError::Permanent,
                 outcome: ReservationOutcome::Neutral,
                 reply: ReserveReply::error(
@@ -248,6 +289,8 @@ impl ReservationService {
                 && !error.trim().is_empty()
             {
                 return Err(ReserveFailure {
+                    reason: rejection_reason(status, Some(error)),
+                    http_status: Some(status.as_u16()),
                     kind: rejection_kind(status, error),
                     outcome: http_failure_outcome(status, Some(error)),
                     reply,
@@ -265,6 +308,8 @@ impl ReservationService {
             }
         }
         Err(ReserveFailure {
+            reason: rejection_reason(status, None),
+            http_status: Some(status.as_u16()),
             outcome: http_failure_outcome(status, None),
             kind: if status.is_client_error() {
                 ReserveError::Permanent
@@ -285,7 +330,12 @@ impl ReservationService {
 
 impl ReserveFailure {
     fn response_transport(error: reqwest::Error, status: StatusCode) -> Self {
+        let is_decode = error.is_decode();
         let mut failure = Self::transport(error);
+        failure.http_status = Some(status.as_u16());
+        if is_decode {
+            failure.reason = "invalid_response";
+        }
         // Once headers are known, 4xx and auth errors must not turn into
         // backend failures just because their error body is malformed or slow.
         if !status.is_success() {
@@ -298,7 +348,7 @@ impl ReserveFailure {
         // A connect timeout happens before delivery. A response/body timeout may
         // happen after reservation creation and must never cause another POST.
         let outcome = if error.is_connect() || error.is_timeout() {
-            ReservationOutcome::BackendFailure
+            ReservationOutcome::BackendFailure(HealthCheckOutcome::from_error(&error))
         } else {
             ReservationOutcome::Neutral
         };
@@ -323,10 +373,30 @@ impl ReserveFailure {
             )
         };
         Self {
+            reason: HealthCheckOutcome::from_error(&error).log_fields().0,
+            http_status: None,
             kind,
             reply,
             outcome,
         }
+    }
+}
+
+/// Stable categories only: upstream error text must never become a metric label.
+fn rejection_reason(status: StatusCode, error: Option<&str>) -> &'static str {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return "authorization_error",
+        StatusCode::TOO_MANY_REQUESTS => return "rate_limited",
+        status if status.is_client_error() => return "invalid_request",
+        _ => {}
+    }
+    match error {
+        Some("Unable to reserve gas coins for the given budget.") => "no_gas_coins",
+        Some("Gas station is in maintenance mode. Please try again later.") => "maintenance",
+        Some("Gas usage exceeds daily cap") => "daily_cap",
+        _ if status.is_server_error() => "http_error",
+        Some(_) => "business_rejection",
+        None => "invalid_response",
     }
 }
 
@@ -356,7 +426,7 @@ fn http_failure_outcome(status: StatusCode, rejection: Option<&str>) -> Reservat
                 | StatusCode::GATEWAY_TIMEOUT
         ) =>
         {
-            ReservationOutcome::BackendFailure
+            ReservationOutcome::BackendFailure(HealthCheckOutcome::HttpStatus(status.as_u16()))
         }
         _ => ReservationOutcome::Neutral,
     }

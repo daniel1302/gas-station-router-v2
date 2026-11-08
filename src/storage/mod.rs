@@ -91,6 +91,9 @@ pub enum ExecutionPhase {
 pub struct ExecutionRecord {
     pub digest: TransactionDigest,
     pub phase: ExecutionPhase,
+    /// Original backend, retained even after the reservation mapping expires.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 /// ExecutionClaim lifecycle
@@ -388,6 +391,20 @@ pub trait Storage: Send + Sync + 'static {
         reservation_id: ReservationId,
     ) -> StorageResult<Option<ExecutionRecord>>;
 
+    /// Acquires a lease for RPC recovery, without authorizing another submission.
+    /// Only Dispatching or Completed records with the same digest are eligible.
+    /// A different owner must wait for the current lease to expire. Ownership
+    /// changes atomically, fencing the previous owner from completion. The phase
+    /// and record TTL are preserved; missing records are never created here.
+    /// Completed records can be recovered when their effects cache has expired.
+    async fn try_claim_recovery(
+        &self,
+        reservation_id: ReservationId,
+        digest: &TransactionDigest,
+        token: ExecutionToken,
+        lease_ttl: Duration,
+    ) -> StorageResult<ExecutionClaim>;
+
     /// Marks an execution as potentially submitted.
     ///
     /// Must be called BEFORE sending the HTTP request
@@ -421,6 +438,7 @@ pub trait Storage: Send + Sync + 'static {
     /// - Store or safely merge the finalized effects.
     /// - Change the execution state to Completed.
     /// - Preserve the existing execution record TTL.
+    /// - Release the lease so a later cache miss can acquire a recovery lease.
     ///
     /// `ttl` applies to the cached transaction effects.
     ///

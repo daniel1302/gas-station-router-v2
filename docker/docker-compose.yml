@@ -73,5 +73,15 @@ services:
       REDIS_DB: "3"
       RUST_LOG: info
 
+  gas-station-4:
+    <<: *gas-station
+    ports: ["127.0.0.1:9530:9527"]
+    environment:
+      GAS_STATION_PRIVATE_KEY: ${GAS_STATION_4_PRIVATE_KEY:?Run cargo run --example e2e -- init first}
+      GAS_STATION_AUTH: ${GS_AUTH:?Set GS_AUTH in docker/.env}
+      IOTA_GRPC_URL: ${IOTA_GRPC_URL:-https://grpc.testnet.iota.cafe}
+      REDIS_DB: "1"
+      RUST_LOG: info
+
 volumes:
   redis-data:

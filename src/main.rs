@@ -5,7 +5,7 @@ use std::{
     process::ExitCode,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use gas_station_router_v2::{
     config::{Config, EXAMPLE_CONFIG},
@@ -37,15 +37,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .with_ansi(io::stderr().is_terminal())
-        .with_writer(io::stderr)
-        .init();
+    if let Err(error) = init_logging() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
+    }
 
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -54,6 +49,27 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn init_logging() -> Result<()> {
+    let json = match std::env::var("LOG_FORMAT").as_deref() {
+        Ok("json") => true,
+        Ok("text") | Err(std::env::VarError::NotPresent) => false,
+        _ => bail!("LOG_FORMAT must be 'text' or 'json'"),
+    };
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .with_writer(io::stderr);
+    if json {
+        subscriber.json().with_ansi(false).init();
+    } else {
+        subscriber.with_ansi(io::stderr().is_terminal()).init();
+    }
+    Ok(())
 }
 
 async fn run(cli: Cli) -> Result<()> {
