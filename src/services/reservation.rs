@@ -10,7 +10,7 @@ use tokio::time::sleep;
 
 use crate::{
     backend::{
-        health::ReservationOutcome,
+        health::{HealthCheckOutcome, ReservationOutcome},
         registry::{Backend, BackendRegistry},
     },
     config::ReserveGasConfig,
@@ -298,7 +298,7 @@ impl ReserveFailure {
         // A connect timeout happens before delivery. A response/body timeout may
         // happen after reservation creation and must never cause another POST.
         let outcome = if error.is_connect() || error.is_timeout() {
-            ReservationOutcome::BackendFailure
+            ReservationOutcome::BackendFailure(HealthCheckOutcome::from_error(&error))
         } else {
             ReservationOutcome::Neutral
         };
@@ -356,7 +356,7 @@ fn http_failure_outcome(status: StatusCode, rejection: Option<&str>) -> Reservat
                 | StatusCode::GATEWAY_TIMEOUT
         ) =>
         {
-            ReservationOutcome::BackendFailure
+            ReservationOutcome::BackendFailure(HealthCheckOutcome::HttpStatus(status.as_u16()))
         }
         _ => ReservationOutcome::Neutral,
     }

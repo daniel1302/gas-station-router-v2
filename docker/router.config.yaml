@@ -57,3 +57,6 @@ backends:
   - name: gas_station_3
     token: ${GS_AUTH}
     rpc: http://127.0.0.1:9529
+  - name: gas_station_4
+    token: ${GS_AUTH}
+    rpc: http://127.0.0.1:9530

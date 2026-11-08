@@ -64,9 +64,20 @@ override it with `RUST_LOG`, for example:
 RUST_LOG=gas_station_router_v2=debug cargo run -- start --config-file config.yaml
 ```
 
+Set `LOG_FORMAT=json` for one JSON object per log line, with structured event fields
+under `fields`. `LOG_FORMAT=text` is the default when the variable is absent.
+Other values fail startup. `RUST_LOG` controls filtering in both formats:
+
+```sh
+LOG_FORMAT=json RUST_LOG=info cargo run -- start --config-file config.yaml
+# Or, from docker/:
+LOG_FORMAT=json RUST_LOG=info ./start-router.sh
+```
+
 Startup, listener addresses, graceful shutdown and fatal command errors are
-logged. Fatal errors exit with code 1. ANSI colors are enabled only when stderr
-is a terminal.
+logged. Fatal errors exit with code 1. In text mode, ANSI colors are enabled only
+when stderr is a terminal. JSON logs never contain ANSI colors. Both formats use
+stderr, so `init` output remains YAML on stdout.
 
 Reservations accept `{"gas_budget": 1000000, "reserve_duration_secs": 60}`.
 When `rpc.token` is nonempty, this endpoint requires `Authorization: Bearer <token>`.
@@ -144,6 +155,30 @@ Use `backoff: 1` for a fixed cooldown. The old `passive.cooldown` key has been r
 to `passive.initial_cooldown`; update existing configs and add `backoff` and
 `max_cooldown`. The old key is rejected as an unknown field.
 
+Health transitions emit `Backend health changed` with `backend`, `previous_health`,
+`health`, `source`, and `reason`. The reason identifies the observation that triggered
+the transition. HTTP observations include `http_status`; transport failures use
+`connection_refused`, `connection_timeout`, `request_timeout`, `connection_error`,
+or `transport_error`, without logging raw errors or request URLs.
+
+The `source` is `background`, `passive`, `cooldown`, or `manual`. Further reasons
+include `http_error`, `http_ok`, `no_gas_coins`, `cooldown_expired`, and
+`manual_override`. Logs include active success/failure counts, the reservation
+failure count, the applicable threshold, and cooldown duration/remaining time in
+milliseconds when available. Transitions to `Degraded` or `Unhealthy` use `WARN`;
+transitions to `Healthy` use `INFO`.
+
+```text
+WARN Backend health changed backend=gas_station_1 previous_health=Healthy health=Unhealthy source="background" reason="http_error" http_status=503 active_success_count=0 active_failure_count=3 reservation_failure_count=0 threshold=3
+```
+
+Unchanged health does not emit a transition log. Cooldown expiry is logged once,
+when next observed by routing, an explicit health read, or an active/passive check.
+It is recorded before applying a new observation, so an unrelated HTTP response is
+not attributed as the cause of cooldown recovery. Expiry while the backend remains
+`Unhealthy` does not produce a false recovery event. Authorization alerts retain
+their separate per-failure `ERROR` log and metric.
+
 The HTTP handler in `api::reservation` calls
 `ReservationService::reserve_with_retry()` for selection, retries and mapping
 storage; `reserve_once()` performs exactly one backend HTTP request.
@@ -201,19 +236,98 @@ transaction BCS or signature encoding returns `400` before storage is modified.
 The digest is calculated from the decoded transaction using the pinned IOTA SDK.
 
 `ExecutionService` exposes only `new()` and `execute()`. Its `executor`, `inflight`
-and `recovery` modules are private. The execution flow is:
+and `recovery` modules are private.
+
+**Execution flow**
 
 ```text
-POST /v1/execute_tx -> ExecutionService -> calculate digest -> get_execution
-  Claimed / missing -> try_claim_execution
-    Acquired -> get_reservation -> persist Dispatching -> Gas Station execute_tx
-             -> validate effects -> complete_execution -> response/cache
-    InFlight -> wait and read the result
-  Dispatching -> acquire recovery lease -> IOTA RPC getTransactionBlock
-    Found -> save effects -> Completed
-    Not found / RPC error -> retry lookup -> still unknown at the timeout
-  Completed -> read cache (recover through RPC if the effects cache has expired)
+                         POST /v1/execute_tx
+                   (alias: /v1/execute_transaction)
+                                  |
+                                  v
+                   HTTP authorization + JSON validation
+                                  |
+                                  v
+                       ExecutionService.execute()
+                                  |
+                                  v
+             Decode transaction/signature, calculate TransactionDigest
+                                  |
+                                  v
+                   Owned task + overall execution timeout
+                                  |
+                                  v
+                  Storage.get_execution(reservation_id)
+                                  |
+              Existing record with a different digest? -- yes --> 409 Conflict
+                                  |
+                                  no
+                                  |
+           +----------------------+-----------------------+
+           |                      |                       |
+           v                      v                       v
+     Missing / Claimed        Dispatching              Completed
+           |                      |                       |
+           v                      v                       v
+ Storage.try_claim_execution() Recovery [B]    Storage.get_transaction(digest)
+           |                                          /       \
+     +-----+------+                                 Found    Missing
+     |            |                                   |         |
+     v            v                                   v         v
+  Acquired     InFlight                        Request type [C] Recovery [B]
+     |            |
+     v            v
+ Dispatch [A]  Wait 100 ms, reread execution state
+
+
+ Dispatch [A]: execution lease acquired
+                     |
+                     v
+          Storage.get_reservation()
+                     |
+                     v
+       Find the original configured backend
+                     |
+                     v
+       Storage.get_transaction(digest)
+                     |
+                     v
+ Check cached backend matches / build upstream request
+                     |
+                     v
+   Storage.mark_execution_dispatching()
+                     |
+          +----------+--------------------+
+          |                               |
+     Cache exists                     Cache missing
+          |                               |
+          |                               v
+          |             POST Gas Station /v1/execute_tx
+          |              (original backend, upstream ID)
+          |                               |
+          |                     +---------+----------+
+          |                     |                    |
+          |              Validated effects     Uncertain result
+          |                     |                    |
+          +----------+----------+                    v
+                     |                         Recovery [B]
+                     |                      (keep current lease)
+                     v
+        Storage.complete_execution()
+        (cache effects + Completed,
+         preserve record TTL, release lease)
+                     |
+                     v
+              Request type [C]
+                     |
+                     v
+                  Response
 ```
+
+If `try_claim_execution()` observes a concurrent transition and returns
+`PossiblySubmitted` or `Completed`, the service rereads execution state. A claim
+conflict returns `409`. Pre-dispatch mapping/backend errors cancel the claim.
+Every wait and RPC operation is bounded by the overall execution timeout.
 
 Only the original reservation backend receives the POST, using its own token and
 upstream reservation ID. Health filtering applies to new reservations, not execution
@@ -229,11 +343,58 @@ fences the previous owner, and preserves the execution record's phase and TTL.
 Completion releases the lease. Backend metadata is retained in the execution record
 so recovery survives reservation mapping expiry or removal of the backend config.
 
+**Recovery flow [B]**
+
+```text
+       Existing Dispatching / Completed with missing cache
+                              |
+                              v
+                 Storage.try_claim_recovery()
+                              |
+             +----------------+----------------+
+             |                |                |
+             v                v                v
+          Acquired         InFlight         Conflict
+             |                |                |
+             |          Wait 100 ms,        409 Conflict
+             |          reread state
+             |
+             +<--- Current dispatch owner after an uncertain POST
+             |     (already owns the lease; no new claim needed)
+             v
+     IOTA RPC: iota_getTransactionBlock(showEffects: true)
+             |
+     +-------+-----------------------------------+
+     |                                           |
+     v                                           v
+ Matching, validated effects          Not found / RPC error / invalid result
+     |                                           |
+     v                                           v
+ Storage.complete_execution()             Wait 200 ms, retry lookup
+ (cache effects + Completed,                      |
+  preserve record TTL, release lease)             v
+     |                                   Overall deadline reached?
+     v                                     /              \
+ Request type [C]                         no                yes
+     |                                    |                 |
+     v                                    v                 v
+  Response                           RPC lookup again   504 Still unknown
+                                                       (phase unchanged)
+```
+
+Recovery only performs RPC lookups; it never submits the transaction again.
+For an already-owned dispatch lease, recovery runs within the original request's
+remaining time budget. A new request waits for or acquires the recovery lease.
+When recovery saves effects, the response still passes through request-type
+handling: `Completed` alone does not establish local execution confirmation.
+
 RPC recovery polls `iota_getTransactionBlock` with `showEffects: true`. The digest,
 effects identity, final execution status and required effects fields are checked.
 Both successful and failed finalized transactions are cached. Empty optional lists
 and object-reference version representations are normalized between Gas Station and
 JSON-RPC responses. Pending, mismatched and invalid results are never cached.
+
+**Request-type handling [C]**
 
 | Cache | Request type | Behavior |
 | --- | --- | --- |

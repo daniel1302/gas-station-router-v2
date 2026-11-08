@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
 
 fn initialize(path: &std::path::Path) -> Result<()> {
     let mut text = String::from("# Local Testnet keys. Do not commit this file.\n");
-    for index in 1..=3 {
+    for index in 1..=4 {
         let mut flagged_key = [0u8; 33];
         OsRng.fill_bytes(&mut flagged_key[1..]);
         text.push_str(&format!(

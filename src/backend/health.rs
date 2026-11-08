@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail, ensure};
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use tokio::{
     sync::watch,
     task::JoinSet,
@@ -28,10 +28,60 @@ pub enum BackendHealth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReservationOutcome {
     Success,
-    BackendFailure,
+    BackendFailure(HealthCheckOutcome),
     NoGasCoins,
     AuthorizationFailure(u16),
     Neutral,
+}
+
+/// Bounded observations retain the cause without logging request URLs or bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HealthCheckOutcome {
+    HttpStatus(u16),
+    ConnectionRefused,
+    ConnectionTimeout,
+    RequestTimeout,
+    ConnectionError,
+    TransportError,
+}
+
+impl HealthCheckOutcome {
+    pub(crate) fn from_error(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            return if error.is_connect() {
+                Self::ConnectionTimeout
+            } else {
+                Self::RequestTimeout
+            };
+        }
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(error) = cause {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+            {
+                return Self::ConnectionRefused;
+            }
+            cause = error.source();
+        }
+        if error.is_connect() {
+            Self::ConnectionError
+        } else {
+            Self::TransportError
+        }
+    }
+
+    pub(super) fn log_fields(self) -> (&'static str, Option<u16>) {
+        match self {
+            Self::HttpStatus(200) => ("http_ok", Some(200)),
+            Self::HttpStatus(status) => ("http_error", Some(status)),
+            Self::ConnectionRefused => ("connection_refused", None),
+            Self::ConnectionTimeout => ("connection_timeout", None),
+            Self::RequestTimeout => ("request_timeout", None),
+            Self::ConnectionError => ("connection_error", None),
+            Self::TransportError => ("transport_error", None),
+        }
+    }
 }
 
 /// ```text
@@ -164,17 +214,17 @@ async fn probe(
     healthy_threshold: u32,
     unhealthy_threshold: u32,
 ) {
-    let success = backend
-        .health_request(client)
-        .send()
-        .await
-        .is_ok_and(|response| response.status() == StatusCode::OK);
-    backend.record_health_result(success, healthy_threshold, unhealthy_threshold);
+    let outcome = match backend.health_request(client).send().await {
+        Ok(response) => HealthCheckOutcome::HttpStatus(response.status().as_u16()),
+        Err(error) => HealthCheckOutcome::from_error(&error),
+    };
+    backend.record_health_result(outcome, healthy_threshold, unhealthy_threshold);
 }
 
 /// Updated under the backend's mutex, including explicit health changes from reservations.
 pub(super) struct HealthState {
     health: BackendHealth,
+    last_logged_health: BackendHealth,
     success_count: u32,
     failure_count: u32,
     reservation_failure_count: u32,
@@ -191,6 +241,7 @@ impl HealthState {
     pub(super) fn new() -> Self {
         Self {
             health: BackendHealth::Healthy,
+            last_logged_health: BackendHealth::Healthy,
             success_count: 0,
             failure_count: 0,
             reservation_failure_count: 0,
@@ -214,6 +265,61 @@ impl HealthState {
         }
     }
 
+    /// Observe lazy cooldown expiry before applying another outcome, so a later
+    /// HTTP response cannot be incorrectly reported as the cause of recovery.
+    pub(super) fn log_cooldown_expiry(&mut self, backend: &str) {
+        self.log_transition(backend, "cooldown", "cooldown_expired", None, None);
+    }
+
+    pub(super) fn log_transition(
+        &mut self,
+        backend: &str,
+        source: &'static str,
+        reason: &'static str,
+        http_status: Option<u16>,
+        threshold: Option<u32>,
+    ) {
+        let health = self.status();
+        let previous_health = self.last_logged_health;
+        if health == previous_health {
+            return;
+        }
+        self.last_logged_health = health;
+        let milliseconds =
+            |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let cooldown_ms = self
+            .cooldown
+            .as_ref()
+            .map(|cooldown| milliseconds(cooldown.duration));
+        let cooldown_remaining_ms = self.cooldown.as_ref().map(|cooldown| {
+            milliseconds(cooldown.duration.saturating_sub(cooldown.started.elapsed()))
+        });
+        macro_rules! log {
+            ($level:ident) => {
+                tracing::$level!(
+                    backend = %backend,
+                    ?previous_health,
+                    ?health,
+                    source,
+                    reason,
+                    http_status,
+                    active_success_count = self.success_count,
+                    active_failure_count = self.failure_count,
+                    reservation_failure_count = self.reservation_failure_count,
+                    threshold,
+                    cooldown_ms,
+                    cooldown_remaining_ms,
+                    "Backend health changed"
+                );
+            };
+        }
+        if health == BackendHealth::Healthy {
+            log!(info);
+        } else {
+            log!(warn);
+        }
+    }
+
     pub(super) fn set_healthy(&mut self, healthy: bool) {
         self.health = if healthy {
             BackendHealth::Healthy
@@ -229,8 +335,7 @@ impl HealthState {
         success: bool,
         healthy_threshold: u32,
         unhealthy_threshold: u32,
-    ) -> Option<BackendHealth> {
-        let previous = self.status();
+    ) {
         if success {
             self.failure_count = 0;
             self.success_count = self.success_count.saturating_add(1);
@@ -244,19 +349,16 @@ impl HealthState {
                 self.health = BackendHealth::Unhealthy;
             }
         }
-        let current = self.status();
-        (current != previous).then_some(current)
     }
 
     pub(super) fn record_reservation(
         &mut self,
         outcome: ReservationOutcome,
         config: &PassiveHealthCheckConfig,
-    ) -> Option<BackendHealth> {
+    ) {
         if !config.enabled {
-            return None;
+            return;
         }
-        let previous = self.status();
         match outcome {
             ReservationOutcome::Success => {
                 // An already in-flight success must not undo a newer cooldown
@@ -266,7 +368,7 @@ impl HealthState {
                     self.cooldown = None;
                 }
             }
-            ReservationOutcome::BackendFailure => {
+            ReservationOutcome::BackendFailure(_) => {
                 self.reservation_failure_count = self.reservation_failure_count.saturating_add(1);
                 if self.reservation_failure_count >= config.failure_threshold {
                     self.health = BackendHealth::Unhealthy;
@@ -289,8 +391,6 @@ impl HealthState {
             }
             ReservationOutcome::AuthorizationFailure(_) | ReservationOutcome::Neutral => {}
         }
-        let current = self.status();
-        (current != previous).then_some(current)
     }
 }
 
