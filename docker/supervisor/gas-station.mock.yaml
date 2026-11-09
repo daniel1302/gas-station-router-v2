@@ -1,0 +1,9 @@
+rpc-host-ip: 127.0.0.1
+rpc-port: 19527
+metrics-port: 19184
+coin-init-config:
+  refresh-interval-sec: 1
+mock:
+  state_dir: docker/.runtime/supervisor-station
+  sponsor_address: "0x0101010101010101010101010101010101010101010101010101010101010101"
+  token: local-e2e-auth

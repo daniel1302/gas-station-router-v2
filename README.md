@@ -41,6 +41,7 @@ cargo run -- supervisor --config-file supervisor.yaml
 ## Development
 
 ```sh
+./docker/e2e.sh
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --all --check

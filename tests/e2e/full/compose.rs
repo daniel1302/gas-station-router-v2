@@ -22,14 +22,15 @@ pub(super) struct Compose {
 impl Compose {
     pub fn local(env_file: &Path) -> Self {
         Self {
-            file: Path::new(ROOT).join("docker/docker-compose.yml"),
+            file: Path::new(ROOT).join("docker/router/docker-compose.yml"),
             env_file: env_file.to_owned(),
             project: Some("gas-station-router-v2-e2e".into()),
         }
     }
 
     pub fn proxy(env_file: &Path, directory: &Path, ports: [u16; 3], id: &str) -> Result<Self> {
-        let mut config = fs::read_to_string(Path::new(ROOT).join("docker/nginx.conf.template"))?;
+        let mut config =
+            fs::read_to_string(Path::new(ROOT).join("docker/router/nginx.conf.template"))?;
         for (name, port) in [
             ("ROUTER_PROXY_PORT", ports[0]),
             ("ROUTER_1_RPC_PORT", ports[1]),

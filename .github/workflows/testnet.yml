@@ -1,0 +1,68 @@
+name: Testnet E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Testnet keys share the same on-chain coins, so runs must not overlap.
+  group: testnet-e2e
+  cancel-in-progress: false
+
+jobs:
+  testnet:
+    name: Testnet transactions and recovery
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Check out the Gas Station fixture
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: daniel1302/gas-station
+          ref: 1e4d68c1d81cf4742e81601b538703716abf283e
+          path: docker/.runtime/gas-station-source
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a  # v2
+      - name: Run Testnet E2E
+        env:
+          GAS_STATION_1_PRIVATE_KEY: ${{ secrets.GAS_STATION_1_PRIVATE_KEY }}
+          GAS_STATION_2_PRIVATE_KEY: ${{ secrets.GAS_STATION_2_PRIVATE_KEY }}
+          GAS_STATION_3_PRIVATE_KEY: ${{ secrets.GAS_STATION_3_PRIVATE_KEY }}
+          GAS_STATION_4_PRIVATE_KEY: ${{ secrets.GAS_STATION_4_PRIVATE_KEY }}
+          GS_AUTH: ${{ secrets.GS_AUTH }}
+          GAS_STATION_SOURCE: ${{ github.workspace }}/docker/.runtime/gas-station-source
+          IOTA_RPC_URL: https://api.testnet.iota.cafe
+          IOTA_GRPC_URL: https://grpc.testnet.iota.cafe
+        run: |
+          # Compose needs an env file; keys stay in the job environment.
+          install -m 600 /dev/null docker/.env
+          ./docker/e2e.sh sponsors
+          ./docker/e2e.sh testnet
+      - name: Stop Testnet services
+        if: always()
+        run: docker compose --env-file docker/.env -f docker/router/docker-compose.yml down --volumes
+        env:
+          GAS_STATION_1_PRIVATE_KEY: ${{ secrets.GAS_STATION_1_PRIVATE_KEY }}
+          GAS_STATION_2_PRIVATE_KEY: ${{ secrets.GAS_STATION_2_PRIVATE_KEY }}
+          GAS_STATION_3_PRIVATE_KEY: ${{ secrets.GAS_STATION_3_PRIVATE_KEY }}
+          GAS_STATION_4_PRIVATE_KEY: ${{ secrets.GAS_STATION_4_PRIVATE_KEY }}
+          GS_AUTH: ${{ secrets.GS_AUTH }}
+      - name: Save router diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: testnet-router-logs
+          path: |
+            docker/.runtime/full-*/router-*.log
+            docker/.runtime/full-*/nginx.log
+          include-hidden-files: true
+          retention-days: 7

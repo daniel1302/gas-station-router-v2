@@ -1,0 +1,35 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --maxmemory-policy
+      - noeviction
+    ports:
+      - "127.0.0.1:${E2E_REDIS_PORT:-16380}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 20
+
+  nginx:
+    image: nginx:stable-alpine
+    network_mode: host
+    environment:
+      ROUTER_PROXY_PORT: ${ROUTER_PROXY_PORT:-19257}
+      ROUTER_1_RPC_PORT: ${ROUTER_1_RPC_PORT:-19261}
+      ROUTER_2_RPC_PORT: ${ROUTER_2_RPC_PORT:-19262}
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      NGINX_ENVSUBST_FILTER: ^ROUTER_
+    volumes:
+      - ../router/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+
+volumes:
+  redis-data:
