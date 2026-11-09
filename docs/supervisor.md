@@ -70,6 +70,8 @@ The first full rescan respects initialization and maintenance locks. Setting
 number of explicit lock failures. This does not bypass approval or activity/network
 guards. `max_full_rescans` limits attempts per supervisor run. Recovery flags are
 one-shot: crash and health restarts always use the normal command.
+Inherited `ALLOW_REINIT`, `DELETE_COIN_REGISTRY` and `IGNORE_LOCKS` variables are
+removed from the child environment so they cannot silently enable a rebuild.
 
 ## Approve one rescan
 

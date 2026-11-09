@@ -40,6 +40,11 @@ impl ProcessController {
     ) -> Result<()> {
         let mut command = Command::new(&config.binary);
         command.arg("--config-path").arg(&config.config);
+        // Gas Station also reads these flags from its environment. Only this
+        // supervisor's one-shot decision may enable destructive recovery.
+        for flag in ["ALLOW_REINIT", "DELETE_COIN_REGISTRY", "IGNORE_LOCKS"] {
+            command.env_remove(flag);
+        }
         if let Some(ignore_locks) = recovery {
             command.args(["--allow-reinit", "--delete-coin-registry"]);
             if ignore_locks {
