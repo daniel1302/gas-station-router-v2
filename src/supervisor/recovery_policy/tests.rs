@@ -172,3 +172,27 @@ async fn native_refresh_waits_for_the_actual_station_refresh_interval() {
     divergent(&mut policy);
     assert!(policy.decide(true).is_none());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_new_incident_starts_with_locks_after_confirmed_recovery() {
+    let mut policy = policy(true);
+    policy.config.aggression.ignore_locks_after = 1;
+    policy.signal(Signal::ReinitializationRequired);
+    policy.signal(Signal::LockBusy);
+    assert!(matches!(
+        policy.decide(true),
+        Some(Action::FullRescan { ignore_locks: true })
+    ));
+    policy.rescanned();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    for _ in 0..3 {
+        policy.observe(sample(0.0));
+    }
+    policy.signal(Signal::ReinitializationRequired);
+    assert!(matches!(
+        policy.decide(true),
+        Some(Action::FullRescan {
+            ignore_locks: false
+        })
+    ));
+}

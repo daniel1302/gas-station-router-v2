@@ -165,6 +165,9 @@ impl RecoveryPolicy {
             {
                 self.pending = None;
             }
+            if self.pending.is_none() {
+                self.lock_failures = 0;
+            }
         }
         if self.failures >= self.config.consistency.consecutive_failures {
             self.refresh_needed = true;
