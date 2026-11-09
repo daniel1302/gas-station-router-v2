@@ -96,7 +96,9 @@ impl ProcessController {
     }
 
     pub async fn stop(&mut self, timeout: Duration) -> Result<()> {
-        if let Some(mut child) = self.child.take() {
+        // Keep ownership in self while awaiting shutdown. If this future is
+        // cancelled, the outer shutdown handler can still stop the process group.
+        if let Some(child) = &mut self.child {
             let pid = child.id();
             if let Some(pid) = pid {
                 signal_group(pid, libc::SIGTERM);
@@ -120,6 +122,7 @@ impl ProcessController {
                 signal_group(pid, libc::SIGKILL);
             }
         }
+        self.child = None;
         self.clear_readers();
         Ok(())
     }

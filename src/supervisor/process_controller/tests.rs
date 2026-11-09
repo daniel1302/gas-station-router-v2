@@ -52,4 +52,25 @@ async fn recovery_flags_are_one_shot_and_shutdown_reaps_the_child() {
         process.stop(Duration::from_secs(2)).await.unwrap();
         assert!(process.pid().is_none());
     }
+
+    // A shutdown signal can cancel recovery while it is stopping the child.
+    fs::write(
+        &config.binary,
+        "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+    )
+    .unwrap();
+    process.start(&config, None, sender).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stopped = tokio::time::timeout(
+        Duration::from_millis(50),
+        process.stop(Duration::from_secs(10)),
+    )
+    .await;
+    assert!(stopped.is_err());
+    assert!(
+        process.pid().is_some(),
+        "Cancelled shutdown lost child ownership"
+    );
+    process.stop(Duration::from_millis(10)).await.unwrap();
+    assert!(process.pid().is_none());
 }
