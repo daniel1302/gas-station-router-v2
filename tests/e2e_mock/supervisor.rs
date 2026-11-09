@@ -28,7 +28,7 @@ impl Fixture {
                 "restart_backoff":"200ms","startup_grace":"500ms","shutdown_timeout":"2s"}
         }});
         fs::write(&config, serde_yaml_ng::to_string(&yaml)?)?;
-        let process = Process::start(
+        let process = Process::start_with_env(
             "gas-station-router-v2",
             &[
                 "supervisor",
@@ -36,6 +36,11 @@ impl Fixture {
                 config.to_str().context("Supervisor config path")?,
             ],
             &directory.join("supervisor.log"),
+            &[
+                ("ALLOW_REINIT", "true"),
+                ("DELETE_COIN_REGISTRY", "true"),
+                ("IGNORE_LOCKS", "true"),
+            ],
         )?;
         println!(
             "[setup] Supervisor PID {}, station {}, metrics {}, auth Bearer {}",
@@ -106,6 +111,10 @@ impl Fixture {
 
 pub async fn run() -> Result<()> {
     let mut fixture = Fixture::start().await?;
+    ensure!(
+        fixture.station.event_count("rescan")? == 0,
+        "Inherited recovery flags bypassed supervisor policy"
+    );
     readiness_and_crash(&fixture).await?;
     gentle_recovery(&fixture).await?;
     approval_and_activity_guards(&fixture).await?;

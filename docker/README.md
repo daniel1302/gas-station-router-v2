@@ -18,7 +18,7 @@ project; cleanup removes only that project's resources.
 | Router | Both routers serve reservations and execution through Nginx; Redis shares the execution cache; each transaction reaches a station once |
 | Failures | A stopped station is excluded and readmitted; Redis failure returns errors; cached results survive its restart |
 | TTL | Reservation, execution and effects keys all expire naturally; reads do not renew TTL; no evictions; only the persistent ID counter needs removal |
-| Supervisor | Readiness and crash restarts, refresh before rebuild, manual approval, activity/network guards, lock failures, configured escalation and child shutdown |
+| Supervisor | Readiness and crash restarts, refresh before rebuild, manual approval, activity/network guards, lock failures, configured escalation, inherited flag isolation and child shutdown |
 
 Mock tests never use real sponsor keys or contact IOTA. The mock implements the
 Gas Station CLI flags and a small HTTP API. `control.json` controls its behavior;

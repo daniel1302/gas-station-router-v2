@@ -52,12 +52,22 @@ pub struct Process {
 
 impl Process {
     pub fn start(binary: &str, args: &[&str], log: &Path) -> Result<Self> {
+        Self::start_with_env(binary, args, log, &[])
+    }
+
+    pub fn start_with_env(
+        binary: &str,
+        args: &[&str],
+        log: &Path,
+        environment: &[(&str, &str)],
+    ) -> Result<Self> {
         use std::os::unix::process::CommandExt;
         let child = Command::new(self::binary(binary)?)
             .args(args)
             .current_dir(ROOT)
             .env("LOG_FORMAT", "json")
             .env("RUST_LOG", "info")
+            .envs(environment.iter().copied())
             .stdout(Stdio::null())
             .stderr(fs::File::create(log)?)
             .process_group(0)

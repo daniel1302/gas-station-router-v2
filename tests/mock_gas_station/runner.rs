@@ -42,7 +42,11 @@ struct MockConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    // Match the real Gas Station's environment-backed recovery flags.
+    args.allow_reinit |= recovery_flag("ALLOW_REINIT")?;
+    args.delete_coin_registry |= recovery_flag("DELETE_COIN_REGISTRY")?;
+    args.ignore_locks |= recovery_flag("IGNORE_LOCKS")?;
     let config: Config = serde_yaml_ng::from_slice(&std::fs::read(&args.config_path)?)?;
     let state = state::State::new(
         config.mock.state_dir,
@@ -63,6 +67,16 @@ async fn main() -> Result<()> {
         axum::serve(metrics, api::router(state)).into_future()
     )?;
     Ok(())
+}
+
+fn recovery_flag(name: &str) -> Result<bool> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid boolean recovery flag")),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(_) => anyhow::bail!("Invalid recovery flag encoding"),
+    }
 }
 
 fn initialize(args: &Args, state: &state::State) -> Result<bool> {
