@@ -8,7 +8,7 @@ use axum::{
 };
 
 use super::RpcState;
-use crate::{
+use crate::router::{
     metrics,
     services::reservation::{ReserveGasRequest, ReserveReply},
 };

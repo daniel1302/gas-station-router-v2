@@ -16,7 +16,7 @@ use super::{
     CachedTransaction, ExecutionClaim, ExecutionRecord, ExecutionToken, Reservation, ReservationId,
     Storage, StorageError, StorageResult, TransactionWriteOutcome,
 };
-use crate::metrics;
+use crate::router::metrics;
 
 mod scripts;
 

@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 use tracing::Instrument;
 
-use crate::{
+use crate::router::{
     backend::registry::BackendRegistry,
     config::{ExecuteTxConfig, IotaConfig, TtlConfig},
     metrics,

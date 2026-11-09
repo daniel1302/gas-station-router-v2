@@ -58,7 +58,7 @@ Leases live inside execution records; there are no separate lease keys or indexe
 One fixed ID counter stays persistent to prevent ID reuse after expiry or restart.
 
 Lua scripts make claims and execution updates atomic across router instances.
-Each operation has its own file in [`src/storage/redis/scripts`](src/storage/redis/scripts),
+Each operation has its own file in [`src/router/storage/redis/scripts`](src/router/storage/redis/scripts),
 with shared helpers for TTL, leases and cache updates.
 Keep the same prefix across replicas. This implementation uses standalone Redis.
 

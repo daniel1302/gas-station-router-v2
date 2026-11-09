@@ -170,7 +170,7 @@ impl ExecutionService {
                     method,
                     backend,
                     digest,
-                    crate::backend::health::HealthCheckOutcome::from_error(&error)
+                    crate::router::backend::health::HealthCheckOutcome::from_error(&error)
                         .log_fields()
                         .0,
                     None,
@@ -194,7 +194,7 @@ impl ExecutionService {
                     if error.is_decode() {
                         "invalid_response"
                     } else {
-                        crate::backend::health::HealthCheckOutcome::from_error(&error)
+                        crate::router::backend::health::HealthCheckOutcome::from_error(&error)
                             .log_fields()
                             .0
                     },

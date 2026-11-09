@@ -5,9 +5,9 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::backend::registry::BackendRegistry;
-use crate::services::execution::ExecutionService;
-use crate::services::reservation::ReservationService;
+use crate::router::backend::registry::BackendRegistry;
+use crate::router::services::execution::ExecutionService;
+use crate::router::services::reservation::ReservationService;
 
 mod execution;
 mod health;

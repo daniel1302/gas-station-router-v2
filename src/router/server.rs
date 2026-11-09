@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
-use crate::{
+use crate::router::{
     api,
     backend::{health::BackgroundHealthChecker, registry::BackendRegistry},
     config::{Config, RoutingAlgorithm, StorageKind},
@@ -42,7 +42,7 @@ pub async fn start(config: Config) -> Result<()> {
         storage.clone(),
         config.routing.execute_tx,
         config.iota,
-        crate::config::TtlConfig {
+        crate::router::config::TtlConfig {
             reservation: config.routing.ttl.reservation,
             transaction_effects: config.routing.ttl.transaction_effects,
         },

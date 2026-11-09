@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, de};
 
-pub const EXAMPLE_CONFIG: &str = include_str!("../config.example.yaml");
+pub const EXAMPLE_CONFIG: &str = include_str!("../../config.example.yaml");
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

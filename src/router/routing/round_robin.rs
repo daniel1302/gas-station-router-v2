@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, sync::Mutex};
 
 use super::{BackendCandidate, BackendSelector};
-use crate::metrics;
+use crate::router::metrics;
 
 /// Rotates backend names, so filtering a failed backend does not skip its peer.
 #[derive(Default)]

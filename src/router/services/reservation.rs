@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::sleep;
 
-use crate::{
+use crate::router::{
     backend::{
         health::{HealthCheckOutcome, ReservationOutcome},
         registry::{Backend, BackendRegistry},

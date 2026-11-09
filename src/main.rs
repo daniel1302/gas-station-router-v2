@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use gas_station_router_v2::{
+use gas_station_router_v2::router::{
     config::{Config, EXAMPLE_CONFIG},
     server,
 };
