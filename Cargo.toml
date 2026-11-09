@@ -38,3 +38,11 @@ wiremock = "0.6"
 [[example]]
 name = "e2e"
 path = "tests/e2e/runner.rs"
+
+[[example]]
+name = "mock-gas-station"
+path = "tests/mock_gas_station/runner.rs"
+
+[[example]]
+name = "mock-e2e"
+path = "tests/e2e_mock/runner.rs"

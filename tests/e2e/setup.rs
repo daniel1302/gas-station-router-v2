@@ -191,7 +191,7 @@ pub(super) fn print_incremental(target: &str, iota_rpc: &str, token: &str) {
     );
     println!("  Status: {target}/status (no auth)");
     println!("  IOTA RPC: {iota_rpc}");
-    let path = Path::new(ROOT).join("docker/router.config.yaml");
+    let path = Path::new(ROOT).join("docker/router/router.config.yaml");
     match read_config::<BackendsConfig>(&path) {
         Ok(config) => {
             println!("  Gas Stations configured in {}:", path.display());

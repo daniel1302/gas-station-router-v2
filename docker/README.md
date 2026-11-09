@@ -1,112 +1,95 @@
-# Local E2E tests
+# E2E tests
 
-Requires Linux, Docker Compose, Rust 1.95, and a `gas-station` checkout next to this
-repository. Nginx uses host networking to reach the two router binaries.
-
-## Fund the sponsors once
+Requires Linux, Docker Compose and Rust 1.95. Run commands from the repository root.
 
 ```sh
-cd docker
-./e2e.sh init       # only when .env does not exist
-./e2e.sh sponsors
+./docker/e2e.sh              # router + supervisor, no keys or Testnet needed
+./docker/e2e.sh router       # two routers, Nginx, Redis and three mock stations
+./docker/e2e.sh supervisor   # supervisor managing a mock Gas Station process
 ```
 
-Fund the three printed addresses with Testnet IOTA, for example 10 IOTA each from
-<https://faucet.testnet.iota.cafe/>. Private keys stay in `.env` (ignored by Git).
+The runner builds the binaries, allocates free ports and prints the setup: station
+addresses and public sponsors, router URLs, metrics, Nginx and test auth. It saves
+logs and JSON reports in `docker/.runtime/`. Each test owns its processes and Docker
+project; cleanup removes only that project's resources.
 
-## Run the full test
+| Test | Checks |
+| --- | --- |
+| Router | Both routers serve reservations and execution through Nginx; Redis shares the execution cache; each transaction reaches a station once |
+| Failures | A stopped station is excluded and readmitted; Redis failure returns errors; cached results survive its restart |
+| TTL | Reservation, execution and effects keys all expire naturally; reads do not renew TTL; no evictions; only the persistent ID counter needs removal |
+| Supervisor | Readiness and crash restarts, refresh before rebuild, manual approval, activity/network guards, lock failures, configured escalation and child shutdown |
+
+Mock tests never use real sponsor keys or contact IOTA. The mock implements the
+Gas Station CLI flags and a small HTTP API. `control.json` controls its behavior;
+`events.jsonl` records launches, flags, refreshes and executions. These files belong
+to the test fixture, not the real Gas Station API. The router scenario takes about
+a minute, including a 40-second TTL drain. The supervisor scenario takes seconds.
+
+## Testnet
+
+Keep a Gas Station checkout next to this repository, then:
 
 ```sh
-./full_e2e.sh
+./docker/e2e.sh init          # once; creates docker/.env and prints four sponsors
+./docker/e2e.sh sponsors     # print the public funding addresses again
+# Fund the first three sponsors with Testnet IOTA.
+./docker/e2e.sh testnet       # full transaction, failure and TTL scenario
 ```
 
-This builds the router, starts Redis and three Gas Stations, and launches two
-router processes behind a separate Nginx container on free local ports. Builds
-and startup happen before the scenario begins. Allow roughly five minutes, plus
-builds, startup, service recovery, and the final TTL drain.
+Use the [Foundation Testnet faucet](https://faucet.testnet.iota.cafe/), for example
+10 IOTA per sponsor. Private keys stay in the ignored `docker/.env`. Foundation
+Testnet JSON-RPC and gRPC endpoints are the defaults. `GAS_STATION_SOURCE` can
+override the checkout path; use an absolute path in `.env`.
 
-The startup summary prints the actual load balancer, both routers, metrics and
-status URLs, and configured Gas Station URLs. It includes the full test
-`Authorization: Bearer ...` headers for the routers and stations. `/status` and
-`/health` on the routers are public. Full e2e uses free ports, so use the printed
-addresses when inspecting a running test.
+This scenario runs real signed transactions for roughly five minutes, plus builds,
+startup, recovery and TTL expiry. It stops and restores one station and Redis,
+checks both routers and verifies transaction effects on Testnet. All three router
+data types must expire without deletion: reservations after 20s, execution records
+after 40s, and effects after 30s. The final report lists keys seen, expired and
+remaining, sampled TTL ranges, renewals, evictions and cleanup results.
 
-This setup is saved in `.runtime/full-*/setup.json` and the final report's `setup`
-field, including test auth tokens. Sponsor private keys stay in `.env`.
+The full test uses three stations. The manual Compose setup retains a fourth
+station, sharing station 1's Redis registry for failover experiments.
 
-The scenario sends signed transactions through Nginx, verifies them on Foundation
-Testnet, and replays each request to check the shared cache. It stops and restores
-one Gas Station, then Redis. Redis outages must return errors; after restart the
-same transaction must still be cached without another dispatch.
-
-Both routers must serve reservations and execution, report the health transitions,
-and observe Redis failures. Every router data key must have TTL, reads must not
-renew it, and no keys may be evicted. The final stage stops new traffic and waits
-for all three data types to expire naturally. Its deadline follows the latest
-observed expiry, with 30 seconds of grace; there is no fixed five-minute cutoff.
-Only then are the owned routers stopped
-and the test's ID counter removed. There is no `FLUSHDB` or data-key cleanup.
-
-`PASS` is printed only after these checks and cleanup succeed. Logs and
-`report.json` are saved under `.runtime/full-*/`. On failure or interruption, the
-test restores Redis and the Gas Station and stops its own routers and proxy.
-The existing local Compose data volume is preserved.
-
-The final summary and JSON report show each key type separately:
-
-| Router key type | Test TTL | Verified at the end |
-| --- | --- | --- |
-| Reservation | 20s | Every observed key expired, none remain |
-| Execution record | 40s | Every observed key expired, none remain |
-| Transaction effects cache | 30s | Every observed key expired, none remain |
-| Reservation ID counter | Persistent | Kept during the test, removed after both routers stop |
-
-For each data type, the summary includes keys seen, expired and remaining, TTL
-checks, and the sampled TTL range. Missing, excessive or renewed TTLs fail the
-test, as do keys disappearing before their expiry. A type with no observed keys
-cannot pass. The report also includes per-router traffic, cache reads, Redis
-restarts and evictions, and whether cleanup left the test namespace empty.
-These checks cover the router's isolated namespace, not Gas Station databases.
-
-## Start two routers for manual testing
+## Manual runs
 
 ```sh
-docker compose up -d --build
-./start-router.sh
+./docker/router/services.sh       # Redis, four real stations and Nginx
+./docker/start-router.sh          # build once and start two routers
 ```
 
-The launcher builds once and starts two copies of the binary. Wait for `Two routers
-ready`, then use another terminal:
+In another terminal:
 
 ```sh
-./e2e.sh reserve
-./e2e.sh transactions --count 9
+./docker/e2e.sh reserve
+./docker/e2e.sh transactions --count 9
+./docker/router/services.sh down  # preserves the local Redis volume
 ```
 
-Nginx listens on `9257` and forwards to routers on `9261` and `9262`. Each response
-includes `X-Router-Upstream`. Router metrics use `9185` and `9186`; router logs are
-in `.runtime/cluster/`. `Ctrl+C` stops both router processes.
-The launcher also prints the topology and test auth, and saves
-`.runtime/cluster/setup.json`.
+Nginx listens on `9257`, routers on `9261`/`9262`, and metrics on `9185`/`9186`.
+`ROUTER_URL` overrides the incremental tests' default `http://127.0.0.1:9257`.
+`Ctrl+C` stops both router processes.
 
-`ROUTER_URL` defaults to `http://127.0.0.1:9257` for incremental tests. For example:
+For a supervisor demo using the mock:
 
 ```sh
-ROUTER_URL=http://127.0.0.1:9257 ./e2e.sh reserve --count 20
-./e2e.sh reserve --count 3 --min-sponsors 1
+./docker/supervisor/start.sh
 ```
 
-Incremental tests print their selected target and auth, plus the Gas Station
-addresses and auth from `router.config.yaml`. With a custom `ROUTER_URL`, that local
-station configuration may differ from the remote router's setup.
+The station listens on `19527`, metrics on `19184`. Status is written to
+`docker/.runtime/supervisor-demo/status.json`. See
+[supervisor recovery settings](../docs/supervisor.md) for real stations.
 
-Redis uses AOF with `appendfsync always` and `noeviction`. Router data uses DB `0`;
-station data uses DBs `1–3`. The default host Redis port is `6380`;
-`ROUTER_REDIS_PORT` changes it and `ROUTER_REDIS_URL` overrides the manual routers'
-connection. Full e2e always targets the local Compose Redis and its own namespace.
+## Layout and CI
 
-`.env` selects Foundation Testnet through `IOTA_RPC_URL` and `IOTA_GRPC_URL`.
-Set `GAS_STATION_SOURCE` there to change the station checkout path (default
-`../../gas-station`). The two-process launcher saves JSON logs by default.
+`router/` contains the real Testnet Compose stack, router config and Nginx template.
+`supervisor/` contains the mock demo. `mock/` contains the isolated Redis/Nginx
+Compose stack. Shared Bash helpers and checks live in `scripts/`.
 
-To stop the Docker services, run `docker compose down`; it preserves Redis data.
+GitHub Actions runs formatting, ShellCheck, YAML checks, Clippy, Rust tests, both
+mock E2E suites and the real Testnet scenario. The Testnet job uses
+`GAS_STATION_1_PRIVATE_KEY` through `GAS_STATION_4_PRIVATE_KEY` and `GS_AUTH` from
+repository secrets. Keys stay in the job environment; the sponsors must be funded.
+Testnet runs are serialized because they share on-chain coins. Fork PRs run the
+mock suites; the secrets-dependent job runs only for this repository's branches.
