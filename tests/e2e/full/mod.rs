@@ -13,7 +13,9 @@ use redis_audit::RedisAudit;
 use traffic::Traffic;
 
 mod compose;
+#[path = "../../e2e_shared/metrics.rs"]
 mod metrics;
+#[path = "../../e2e_shared/redis_audit.rs"]
 mod redis_audit;
 mod summary;
 mod traffic;

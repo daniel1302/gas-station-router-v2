@@ -1355,6 +1355,7 @@ dependencies = [
  "humantime-serde",
  "iota-sdk-crypto",
  "iota-sdk-types",
+ "libc",
  "prometheus",
  "rand 0.8.8",
  "redis",

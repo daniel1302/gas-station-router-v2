@@ -2,3 +2,4 @@
 /config.yaml
 /docker/.env
 /docker/.runtime/
+/.supervisor/

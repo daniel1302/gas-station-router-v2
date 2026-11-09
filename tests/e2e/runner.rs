@@ -32,7 +32,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Action {
-    /// Generate three sponsor keys and a token in .env; never overwrite it.
+    /// Generate four sponsor keys and a token in .env; never overwrite it.
     Init,
     /// Print only the public sponsor addresses to fund.
     Sponsors,
@@ -111,7 +111,7 @@ fn initialize(path: &std::path::Path) -> Result<()> {
 }
 
 fn print_sponsors() -> Result<()> {
-    for index in 1..=3 {
+    for index in 1..=4 {
         let name = format!("GAS_STATION_{index}_PRIVATE_KEY");
         let encoded = std::env::var(&name).with_context(|| format!("Missing {name}; run init"))?;
         let bytes =
