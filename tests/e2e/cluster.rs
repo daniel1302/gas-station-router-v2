@@ -62,7 +62,7 @@ pub(super) fn unused_ports() -> Result<[u16; 5]> {
 }
 
 fn write_config(settings: &Settings, index: usize) -> Result<PathBuf> {
-    let source = Path::new(ROOT).join("docker/router.config.yaml");
+    let source = Path::new(ROOT).join("docker/router/router.config.yaml");
     let mut yaml: Value = serde_yaml_ng::from_str(&fs::read_to_string(source)?)?;
     yaml["rpc"]["port"] = settings.rpc[index].into();
     yaml["metrics"]["port"] = settings.metrics[index].into();
@@ -203,8 +203,12 @@ pub(super) async fn run() -> Result<()> {
             port("ROUTER_2_METRICS_PORT", 9186)?,
         ],
         directory: Path::new(ROOT).join("docker/.runtime/cluster"),
-        redis_url: std::env::var("ROUTER_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6380/0".into()),
+        redis_url: std::env::var("ROUTER_REDIS_URL").unwrap_or_else(|_| {
+            format!(
+                "redis://127.0.0.1:{}/0",
+                std::env::var("ROUTER_REDIS_PORT").unwrap_or_else(|_| "6380".into())
+            )
+        }),
         prefix: None,
     };
     let mut cluster = Cluster::start(settings).await?;

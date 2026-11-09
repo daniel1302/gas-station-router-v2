@@ -3,7 +3,7 @@ name: gas-station-router-v2-e2e
 x-gas-station: &gas-station
   image: gas-station-router-v2-e2e-backend:local
   build:
-    context: ${GAS_STATION_SOURCE:-../../gas-station}
+    context: ${GAS_STATION_SOURCE:-../../../gas-station}
     dockerfile_inline: |
       FROM rust:1.95-bookworm AS builder
       RUN apt-get update && apt-get install -y --no-install-recommends clang pkg-config libssl-dev \
@@ -33,7 +33,14 @@ x-gas-station: &gas-station
 services:
   redis:
     image: redis:7.4-alpine
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - always
+      - --maxmemory-policy
+      - noeviction
     ports: ["127.0.0.1:${ROUTER_REDIS_PORT:-6380}:6379"]
     volumes:
       - redis-data:/data

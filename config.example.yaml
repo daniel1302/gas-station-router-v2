@@ -13,7 +13,7 @@ iota:
   timeout: 5s
 
 storage:
-  kind: memory # memory | redis
+  kind: memory  # memory | redis
   redis:
     url: ${REDIS_URL}
     key_prefix: gas-station-router

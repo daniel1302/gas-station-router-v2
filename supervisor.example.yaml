@@ -1,0 +1,46 @@
+supervisor:
+  health:
+    enabled: true
+    interval: 5s
+    timeout: 2s
+    unhealthy_threshold: 3
+    # Set only when your Gas Station provides a readiness endpoint.
+    readiness_path: null
+
+  pool:
+    metrics_interval: 15s
+    timeout: 2s
+    # Optional JSON-RPC endpoint and public sponsor address for reconciliation.
+    rpc_url: null
+    sponsor_address: null
+    expected_chain_id: null
+
+  recovery:
+    auto_refresh: true
+    # The current Gas Station has no refresh HTTP API. By default, wait for its
+    # configured refresh-interval-sec instead. A custom adapter can supply a URL.
+    refresh_url: null
+    refresh_grace_period: 60s
+    auto_full_rescan: false
+    require_manual_approval: true
+
+    consistency:
+      balance_divergence_threshold: 20
+      coin_count_divergence_threshold: 20
+      consecutive_failures: 3
+
+    aggression:
+      refresh_attempts_before_rescan: 1
+      max_full_rescans: 3
+      # Zero never bypasses locks. A positive value permits --ignore-locks only
+      # after this many explicit lock failures and a separately approved rescan.
+      ignore_locks_after: 0
+
+  process:
+    restart_on_crash: true
+    restart_backoff: 10s
+    startup_grace: 60s
+    shutdown_timeout: 10s
+    binary: /path/to/gas-station
+    config: /path/to/gas-station.yaml
+    state_dir: .supervisor

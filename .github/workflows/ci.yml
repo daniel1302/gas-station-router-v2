@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Rust and script checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install tools
+        run: |
+          rustup show
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck shfmt yamllint
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a  # v2
+      - name: Check formatting and scripts
+        run: ./docker/scripts/check.sh
+      - name: Check Rust
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Run tests
+        run: |
+          docker pull redis:7.4-alpine
+          cargo test --locked --all-targets
+
+  e2e:
+    name: E2E / ${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [router, supervisor]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - name: Install Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a  # v2
+      - name: Run process E2E tests
+        run: ./docker/e2e.sh ${{ matrix.suite }}
+      - name: Save test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: e2e-${{ matrix.suite }}
+          path: docker/.runtime/
+          include-hidden-files: true
+          retention-days: 7

@@ -1,0 +1,20 @@
+supervisor:
+  health:
+    interval: 1s
+    timeout: 500ms
+    readiness_path: /ready
+  pool:
+    metrics_interval: 1s
+    rpc_url: http://127.0.0.1:19527/rpc
+    sponsor_address: "0x0101010101010101010101010101010101010101010101010101010101010101"
+    expected_chain_id: mock-testnet
+  recovery:
+    refresh_url: http://127.0.0.1:19527/refresh
+    refresh_grace_period: 2s
+  process:
+    binary: target/debug/examples/mock-gas-station
+    config: docker/supervisor/gas-station.mock.yaml
+    state_dir: docker/.runtime/supervisor-demo
+    restart_backoff: 1s
+    startup_grace: 2s
+    shutdown_timeout: 2s
