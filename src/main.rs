@@ -15,7 +15,7 @@ use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(version, about = "Simple Gas Station router")]
+#[command(version, about = "Gas Station router and supervisor")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -23,6 +23,18 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Start and supervise one Gas Station process.
+    Supervisor {
+        #[arg(long)]
+        config_file: Option<PathBuf>,
+        #[arg(long)]
+        gas_station_binary: Option<PathBuf>,
+        #[arg(long)]
+        gas_station_config: Option<PathBuf>,
+        /// Authorize one full rescan after verifying network and in-flight work.
+        #[arg(long)]
+        approve_recovery: bool,
+    },
     /// Start the RPC and metrics HTTP servers.
     Start {
         #[arg(long)]
@@ -74,6 +86,25 @@ fn init_logging() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.command {
+        Command::Supervisor {
+            config_file,
+            gas_station_binary,
+            gas_station_config,
+            approve_recovery,
+        } => {
+            use gas_station_router_v2::supervisor;
+            let mut config = config_file
+                .map(|path| supervisor::config::Config::load(&path))
+                .transpose()?
+                .unwrap_or_default();
+            if let Some(binary) = gas_station_binary {
+                config.process.binary = binary;
+            }
+            if let Some(path) = gas_station_config {
+                config.process.config = path;
+            }
+            supervisor::run(config, approve_recovery).await
+        }
         Command::Start { config_file } => server::start(Config::load(&config_file)?).await,
         Command::Init { config_file } => {
             if let Some(path) = config_file {
