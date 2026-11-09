@@ -8,7 +8,7 @@ use axum::{
 };
 
 use super::RpcState;
-use crate::services::execution::{ExecuteTxRequest, ExecutionReply};
+use crate::router::services::execution::{ExecuteTxRequest, ExecutionReply};
 
 pub(super) async fn execute_transaction(
     State(state): State<Arc<RpcState>>,

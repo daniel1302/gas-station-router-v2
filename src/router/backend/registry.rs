@@ -8,7 +8,7 @@ use std::{
 
 use super::health::{BackendHealth, HealthCheckOutcome, HealthState, ReservationOutcome};
 use super::status::{BackendStatus, RegistryStatus};
-use crate::{
+use crate::router::{
     config::{BackendConfig, PassiveHealthCheckConfig},
     metrics,
     routing::BackendCandidate,

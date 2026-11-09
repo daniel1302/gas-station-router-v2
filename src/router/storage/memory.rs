@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::metrics;
+use crate::router::metrics;
 use async_trait::async_trait;
 use iota_sdk_types::TransactionDigest;
 use tokio::{sync::Mutex, time::Instant};

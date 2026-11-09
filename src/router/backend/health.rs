@@ -10,7 +10,7 @@ use tokio::{
 };
 
 use super::registry::{Backend, BackendRegistry};
-use crate::{
+use crate::router::{
     config::{HealthChecksConfig, PassiveHealthCheckConfig},
     metrics,
 };
