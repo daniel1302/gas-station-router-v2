@@ -46,9 +46,12 @@ storage:
     key_prefix: gas-station-router
 ```
 
-Use Redis 7.4 with persistence enabled and `maxmemory-policy noeviction`. The router
-checks the policy at startup. When Redis is full, writes fail instead of silently
-evicting execution records. Connections and commands have a 2-second timeout.
+Use Redis 7.4 with persistence enabled. The router accepts evicting Redis
+policies but warns at startup when the policy is not `noeviction`. Prefer
+`maxmemory-policy noeviction`: an eviction can remove a reservation or execution
+record before its TTL and permit resubmission. With `noeviction`, writes fail
+when Redis is full instead of silently losing those records. Connections and
+commands have a 2-second timeout.
 
 Keys use `<key_prefix>:v2:`. Reservations use `routing.ttl.reservation`, execution
 records use `routing.execute_tx.inflight.record_ttl`, and effects use

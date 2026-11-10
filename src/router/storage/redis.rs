@@ -40,7 +40,7 @@ struct StoredTransaction {
 
 impl RedisStorage {
     /// Connect to standalone Redis. A shared prefix identifies one router fleet.
-    /// Redis must use noeviction: losing execution records can permit resubmission.
+    /// An evicting Redis policy can lose execution records before their TTL.
     pub async fn new(url: &str, key_prefix: &str) -> StorageResult<Self> {
         if key_prefix.trim().is_empty() {
             return Err(backend_error("connect", "empty_key_prefix"));
@@ -62,14 +62,18 @@ impl RedisStorage {
             connection,
             prefix: format!("{key_prefix}:v2"),
         };
-        let info: String = storage
-            .command("connect", redis::cmd("INFO").arg("memory"))
-            .await?;
-        if !info
-            .lines()
-            .any(|line| line.trim() == "maxmemory_policy:noeviction")
+        if let Ok(info) = storage
+            .command::<String>("connect", redis::cmd("INFO").arg("memory"))
+            .await
         {
-            return Err(backend_error("connect", "noeviction_required"));
+            if !info
+                .lines()
+                .any(|line| line.trim() == "maxmemory_policy:noeviction")
+            {
+                tracing::warn!(
+                    "Redis eviction may remove execution records before their TTL and permit resubmission"
+                );
+            }
         }
         Ok(storage)
     }

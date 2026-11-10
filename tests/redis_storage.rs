@@ -572,7 +572,7 @@ async fn ids_survive_new_clients_are_exact_above_f64_precision_and_never_wrap() 
 }
 
 #[tokio::test]
-async fn oom_rejects_writes_without_eviction_and_eviction_policies_are_rejected() {
+async fn oom_rejects_writes_without_eviction_and_eviction_policies_are_accepted() {
     let redis = RedisServer::new().await;
     let store = redis.store().await;
     let id = store
@@ -605,10 +605,10 @@ async fn oom_rejects_writes_without_eviction_and_eviction_policies_are_rejected(
             redis::cmd("CONFIG")
                 .arg("SET")
                 .arg("maxmemory-policy")
-                .arg("allkeys-lru"),
+                .arg("volatile-lru"),
         )
         .await;
-    assert!(RedisStorage::new(&redis.url, PREFIX).await.is_err());
+    RedisStorage::new(&redis.url, PREFIX).await.unwrap();
 }
 
 #[tokio::test]
